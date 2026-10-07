@@ -1,0 +1,657 @@
+From eee20419d1bd848d7a6283b39fb8874b15f416e3 Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Tue, 15 Sep 2026 11:38:28 +0800
+Subject: [PATCH] EDBT v4 B5 (Phase B2): shared all-storage initial candidates
+ + all-policy typed-counter observation + single-client measured diagnostic
+ pass
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+B2-2 shared all-storage initial candidate enumerator: PlanAnalyzer::analyze()
+now builds EVERY policy's initial candidate set from the full store
+(analyze_by_frequency, sealed chunks only — mirroring the daemon's per-cycle
+scan exactly) and overlays the audited LQP access_type / cardinality onto
+referenced segments for plan-aware arms (resolve_segments' chunk-pruning
+semantics preserved). Unreferenced segments remain candidates with
+access_type=Unknown. our_full initial set 4718 -> 7392 = our_freq = daemon
+set; initial/daemon candidate-set hashes identical across policies.
+
+B2-4 typed-counter observation for ALL policies: the daemon enumeration reads
+the five raw cumulative pattern counters + calibration dtype/bytes-per-value
+unconditionally (cost aggregation remains cost_c3_greedy-only, whose
+calibration table is only loaded there). Every decision-trace row of every
+policy now carries sequential/monotonic/random/point/dictionary counts;
+non-c3 rows use dictionary_handling=observed_not_scored and empty costs.
+
+B2-5 single-client measured diagnostic pass (--placement_trace_measured,
+default off; CLI-gated to --placement_trace + --clients 1): runs after the
+initial placement, before the daemon starts. Per query: counter snapshot ->
+own-pipeline execution -> snapshot; deltas are exact per-execution
+measurements (measured_per_execution). Emits <json>_measured_segment_access.csv
+and appends measured operator rows to the operator trace (rows/wall from the
+executed PQPs' performance data). actual_reads is filled only under the
+unique-scan attribution rule (exactly one TableScan of that query references
+the segment's (table,column)); otherwise null. clients=10 mechanism runs
+never enable this path (execute_item exposes statement-level metrics only —
+no per-operator data; documented in POLICY_SPEC).
+
+Preflight (our_full, trace+measured, clients=1, 30s): placement 7392
+(369 Local / 7023 CXL); trace tail columns populated for our_full;
+95,528 measured segment rows; 1,987,067 measured operator rows (389 with
+non-null actual_reads).
+---
+ src/benchmark/join_order_benchmark.cpp    |  22 ++
+ src/lib/types.hpp                         |  15 +
+ src/plugins/plan_analyzer.cpp             |  55 +++-
+ src/plugins/semantic_placement_plugin.cpp | 352 +++++++++++++++++++---
+ src/plugins/semantic_placement_plugin.hpp |  17 ++
+ 5 files changed, 413 insertions(+), 48 deletions(-)
+
+diff --git a/src/benchmark/join_order_benchmark.cpp b/src/benchmark/join_order_benchmark.cpp
+index b26b9dbe6..3cb8c5947 100644
+--- a/src/benchmark/join_order_benchmark.cpp
++++ b/src/benchmark/join_order_benchmark.cpp
+@@ -180,6 +180,11 @@ int main(int argc, char* argv[]) {
+                       "<json>_decision_trace.csv + <json>_operator_segment_trace.csv; run identity "
+                       "from EDBT_V4_RUN_ID / EDBT_V4_REP env vars",
+                       cxxopts::value<bool>()->default_value("false")) // NOLINT
++  ("placement_trace_measured", "[EDBT v4 B2] Single-client measured diagnostic pass (requires "
++                              "--placement_trace and --clients 1): sequential per-query counter-"
++                              "snapshot execution after the initial placement; measured_per_execution "
++                              "rows in the operator trace + <json>_measured_segment_access.csv",
++                              cxxopts::value<bool>()->default_value("false")) // NOLINT
+   ("cost_c3_greedy", "[EDBT v4 B3] Cost-C3 greedy baseline: priority = predicted cost difference "
+                      "cost(CXL) - cost(DRAM) from the calibration table and the raw four-pattern "
+                      "segment access counters (sequential/monotonic/random/point); shares the "
+@@ -216,6 +221,7 @@ int main(int argc, char* argv[]) {
+   auto placement_wfreq = false;
+   auto placement_kappa = 1.0f;
+   auto placement_trace = false;
++  auto placement_trace_measured = false;
+   auto cost_c3_greedy = false;
+   auto c3_calibration = std::string{};
+ 
+@@ -259,9 +265,24 @@ int main(int argc, char* argv[]) {
+   placement_wfreq = cli_parse_result["placement_wfreq"].as<bool>();
+   placement_kappa = cli_parse_result["placement_kappa"].as<float>();
+   placement_trace = cli_parse_result["placement_trace"].as<bool>();
++  placement_trace_measured = cli_parse_result["placement_trace_measured"].as<bool>();
+   cost_c3_greedy = cli_parse_result["cost_c3_greedy"].as<bool>();
+   c3_calibration = cli_parse_result["c3_calibration"].as<std::string>();
+ 
++  // [EDBT v4 B2] the measured diagnostic pass is only meaningful with sequential
++  // execution: a shared counter delta under concurrency is not a per-execution
++  // measurement. Gate it hard instead of fabricating attribution.
++  if (placement_trace_measured) {
++    if (!placement_trace) {
++      std::cerr << "--placement_trace_measured requires --placement_trace\n";
++      return 1;
++    }
++    if (benchmark_config->clients != 1) {
++      std::cerr << "--placement_trace_measured requires --clients 1 (got " << benchmark_config->clients << ")\n";
++      return 1;
++    }
++  }
++
+   // [EDBT v4 B3] cost_c3_greedy is a third migration policy, not an ablation
+   // arm: it must not be combined with the d1/wfreq priority variants and needs
+   // its calibration table.
+@@ -400,6 +421,7 @@ int main(int argc, char* argv[]) {
+                                      .placement_kappa = placement_kappa,
+                                      .placement_query_path = query_path,
+                                      .placement_trace = placement_trace,
++                                     .placement_trace_measured = placement_trace_measured,
+                                      .cost_c3_greedy = cost_c3_greedy,
+                                      .c3_calibration_path = c3_calibration};
+ 
+diff --git a/src/lib/types.hpp b/src/lib/types.hpp
+index e1ceec9c6..7565f43ec 100644
+--- a/src/lib/types.hpp
++++ b/src/lib/types.hpp
+@@ -124,6 +124,21 @@ struct PlacementOptions {
+   // EDBT_V4_RUN_ID / EDBT_V4_REP environment variables (harness-controlled),
+   // defaulting to the JSON file stem and rep 1.
+   bool placement_trace = false;
++  // EDBT v4 Phase B2: single-client MEASURED diagnostic pass (default OFF).
++  // Requires placement_trace and the JOB CLI only allows it with --clients 1.
++  // After the initial placement and before the migration daemon starts, the
++  // plugin executes each workload query once, sequentially, taking segment
++  // counter snapshots before/after every query: the per-segment five-pattern
++  // counter delta is a true measured value for that execution window
++  // (attribution_level=measured_per_execution; written to
++  // <json>_measured_segment_access.csv). Per-operator wall/rows come from the
++  // executed PQPs' performance data (<json>_operator_segment_trace.csv gains
++  // measured_per_execution rows); actual_reads on an operator row is filled
++  // ONLY when exactly one PQP scan of that query references the segment's
++  // (table, column) — otherwise it stays null (never fabricated). The main
++  // clients=10 mechanism runs never enable this path and stay
++  // plan_reference_only / counter-free.
++  bool placement_trace_measured = false;
+   // EDBT v4 Phase B (commit B3): cost_c3_greedy baseline priority provider.
+   // cost(s, dev) = Σ_γ calibration(dev, γ, dtype(s)) × count_γ(s) ×
+   // bytes_per_value(s) over the four-pattern counter set
+diff --git a/src/plugins/plan_analyzer.cpp b/src/plugins/plan_analyzer.cpp
+index c1a5ccb95..ed61fa2fb 100644
+--- a/src/plugins/plan_analyzer.cpp
++++ b/src/plugins/plan_analyzer.cpp
+@@ -234,8 +234,14 @@ static const std::vector<std::string> tpcc_representative_queries = {
+     "WHERE OL_W_ID = 1 AND OL_D_ID = 1 AND OL_O_ID >= 1 AND S_W_ID = 1 AND S_QUANTITY < 10;"};
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+-// Δ1 Ablation: frequency-based fallback (when --ablate_d1 is set).
+-// Instead of LQP analysis, reads SegmentAccessCounter for all segments.
++// Shared all-storage base enumeration (EDBT v4 B2).
++// Enumerates every (table, chunk, column) segment of the loaded store, mirroring
++// the migration daemon's per-cycle candidate scan exactly (sealed chunks only,
++// all columns). This is the candidate-set backbone for ALL policies: our_freq
++// (--ablate_d1) keeps access_type=Unknown everywhere; our_full overlays the
++// audited LQP signals (analyze()); cost_c3_greedy consumes the same set and
++// differs only in its typed-cost benefit. Initial and daemon candidate-set
++// hashes are therefore identical by construction.
+ // ─────────────────────────────────────────────────────────────────────────────
+ static std::vector<SegmentPlacementDecision> analyze_by_frequency() {
+   auto decisions = std::vector<SegmentPlacementDecision>{};
+@@ -246,7 +252,9 @@ static std::vector<SegmentPlacementDecision> analyze_by_frequency() {
+     const auto column_count = table->column_count();
+     for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
+       const auto& chunk = table->get_chunk(chunk_id);
+-      if (!chunk) continue;
++      // Mirror the daemon's candidate scan: mutable chunks are never migration
++      // candidates, so they are excluded here too (identical candidate set).
++      if (!chunk || chunk->is_mutable()) continue;
+       const auto is_immutable = !chunk->is_mutable();
+       for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
+         const auto& segment = chunk->get_segment(column_id);
+@@ -271,18 +279,39 @@ static std::vector<SegmentPlacementDecision> analyze_by_frequency() {
+ // PlanAnalyzer::analyze — main entry point (stages 1-3)
+ // ─────────────────────────────────────────────────────────────────────────────
+ std::vector<SegmentPlacementDecision> PlanAnalyzer::analyze(AbstractBenchmarkItemRunner& runner, bool ablate_d1) {
+-  if (ablate_d1) {
+-    auto decisions = analyze_by_frequency();
+-    tag_segments(decisions);
+-    return decisions;
++  // [EDBT v4 B2] Shared all-storage initial candidate enumerator: the base set
++  // is the full store (analyze_by_frequency, sealed chunks only) for EVERY
++  // policy, so the initial candidate set and every daemon cycle's set are
++  // identical by construction. Policy differences live only in per-segment
++  // signals, never in the candidate set.
++  auto decisions = analyze_by_frequency();
++
++  if (!ablate_d1) {
++    // our_full: overlay the audited LQP signals onto the full-store base.
++    // Signals are expanded through the unchanged resolve_segments() (preserving
++    // its chunk-pruning semantics) and only access_type / estimated_cardinality
++    // are overwritten for referenced segments. Segments never referenced by a
++    // plan REMAIN candidates with access_type=Unknown and cardinality 0.
++    const auto signals = analyze_lqps();
++    const auto plan_decisions = resolve_segments(signals);
++    auto overlay = std::unordered_map<std::string, size_t>{};
++    overlay.reserve(plan_decisions.size() * 2);
++    for (auto i = size_t{0}; i < plan_decisions.size(); ++i) {
++      const auto& plan_decision = plan_decisions[i];
++      const auto key = plan_decision.table_name + ":" + std::to_string(plan_decision.chunk_id) + ":" +
++                       std::to_string(plan_decision.column_id);
++      overlay[key] = i;
++    }
++    for (auto& decision : decisions) {
++      const auto key = decision.table_name + ":" + std::to_string(decision.chunk_id) + ":" +
++                       std::to_string(decision.column_id);
++      const auto it = overlay.find(key);
++      if (it == overlay.end()) continue;
++      decision.access_type = plan_decisions[it->second].access_type;
++      decision.estimated_cardinality = plan_decisions[it->second].estimated_cardinality;
++    }
+   }
+ 
+-  // Stage 1: Plan Analyzer — build SQL pipelines, traverse LQPs
+-  auto signals = analyze_lqps();
+-
+-  // Stage 2: Object Resolver — expand to concrete segment lists
+-  auto decisions = resolve_segments(signals);
+-
+   // Stage 3: Characteristic Tagger — tag with volume, frequency, immutability
+   tag_segments(decisions);
+ 
+diff --git a/src/plugins/semantic_placement_plugin.cpp b/src/plugins/semantic_placement_plugin.cpp
+index 7c79f9e6c..17ae53cd2 100644
+--- a/src/plugins/semantic_placement_plugin.cpp
++++ b/src/plugins/semantic_placement_plugin.cpp
+@@ -8,16 +8,25 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <ctime>
++#include <filesystem>
+ #include <fstream>
++#include <functional>
+ #include <iostream>
+ #include <numeric>
++#include <optional>
+ #include <set>
+ #include <sstream>
+ #include <unordered_map>
+ 
+ #include "../benchmarklib/abstract_benchmark_item_runner.hpp"
++#include "expression/abstract_expression.hpp"
++#include "expression/pqp_column_expression.hpp"
+ #include "hyrise.hpp"
+ #include "memory/linear_numa_memory_resource.hpp"
++#include "operators/abstract_operator.hpp"
++#include "operators/get_table.hpp"
++#include "operators/table_scan.hpp"
++#include "sql/sql_pipeline_builder.hpp"
+ #include "storage/chunk.hpp"
+ #include "storage/segment_access_counter.hpp"
+ #include "storage/table.hpp"
+@@ -230,6 +239,13 @@ std::optional<PreBenchmarkHook> SemanticPlacementPlugin::pre_benchmark_hook() {
+       }
+       _plan_analyzer.write_operator_reference_trace(_operator_trace_path, _trace_run_id, _trace_config,
+                                                     _trace_rep);
++      // [EDBT v4 B2] single-client measured diagnostic pass: after the initial
++      // placement (static tiers), strictly before the daemon starts. The JOB
++      // CLI gates this to --clients 1; inert in every clients=10 run.
++      _trace_measured = options.placement_trace_measured;
++      if (_trace_measured) {
++        run_measured_diagnostic_pass();
++      }
+     }
+ 
+     // 8. Start daemon thread (if enabled)
+@@ -512,40 +528,47 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+         if (access_rate > max_rate) max_rate = access_rate;
+         if (volume > max_volume) max_volume = volume;
+ 
+-        // [EDBT v4 B3] cost_c3_greedy inputs: raw four-pattern counters read
+-        // once per cycle (cumulative values — no EMA, no normalization; the
+-        // Dictionary count is reported but excluded from the cost model).
+         auto c3_cost = std::pair<double, double>{0.0, 0.0};  // {dram, cxl}
+         auto c3_counts = std::array<uint64_t, 5>{};          // seq,mon,rand,point,dict
+         auto c3_bytes_per_value = uint64_t{0};
++        // [EDBT v4 B2] typed-counter observation for ALL policies: the five raw
++        // cumulative pattern counters (sequential, monotonic, random, point,
++        // dictionary) plus the calibration dtype key / bytes-per-value are read
++        // unconditionally each cycle and emitted on every trace row. The cost
++        // aggregation stays exclusive to cost_c3_greedy (its calibration table
++        // is only loaded in that arm); all other arms carry the counts as
++        // observation-only (dictionary_handling=observed_not_scored, costs
++        // empty in the trace) — they never feed those arms' priorities.
++        using SAC = SegmentAccessCounter::AccessType;
++        const auto& counter = segment->access_counter;
++        c3_counts = {counter[SAC::Sequential].load(std::memory_order_relaxed),
++                     counter[SAC::Monotonic].load(std::memory_order_relaxed),
++                     counter[SAC::Random].load(std::memory_order_relaxed),
++                     counter[SAC::Point].load(std::memory_order_relaxed),
++                     counter[SAC::Dictionary].load(std::memory_order_relaxed)};
++        // Calibration dtype key from the column's data type (trace uses the
++        // same mapping). Null columns have no calibration entry; treat them
++        // as 8-byte int64 (documented; JOB has none).
++        const auto dtype = table->column_data_type(col_id);
++        const auto* calib_type = "int64";
++        switch (dtype) {
++          case DataType::Int:    calib_type = "int32"; c3_bytes_per_value = 4; break;
++          case DataType::Long:   calib_type = "int64"; c3_bytes_per_value = 8; break;
++          case DataType::Float:  calib_type = "float32"; c3_bytes_per_value = 4; break;
++          case DataType::Double: calib_type = "float64"; c3_bytes_per_value = 8; break;
++          case DataType::String: calib_type = "string16"; c3_bytes_per_value = 16; break;
++          case DataType::Null:   calib_type = "int64"; c3_bytes_per_value = 8; break;
++        }
+         if (_c3_greedy) {
+-          using SAC = SegmentAccessCounter::AccessType;
+-          const auto& counter = segment->access_counter;
+-          c3_counts = {counter[SAC::Sequential].load(std::memory_order_relaxed),
+-                       counter[SAC::Monotonic].load(std::memory_order_relaxed),
+-                       counter[SAC::Random].load(std::memory_order_relaxed),
+-                       counter[SAC::Point].load(std::memory_order_relaxed),
+-                       counter[SAC::Dictionary].load(std::memory_order_relaxed)};
+-          // Calibration dtype key from the column's data type (trace uses the
+-          // same mapping). Null columns have no calibration entry; treat them
+-          // as 8-byte int64 (documented; JOB has none).
+-          const auto dtype = table->column_data_type(col_id);
+-          const auto* calib_type = "int64";
+-          switch (dtype) {
+-            case DataType::Int:    calib_type = "int32"; c3_bytes_per_value = 4; break;
+-            case DataType::Long:   calib_type = "int64"; c3_bytes_per_value = 8; break;
+-            case DataType::Float:  calib_type = "float32"; c3_bytes_per_value = 4; break;
+-            case DataType::Double: calib_type = "float64"; c3_bytes_per_value = 8; break;
+-            case DataType::String: calib_type = "string16"; c3_bytes_per_value = 16; break;
+-            case DataType::Null:   calib_type = "int64"; c3_bytes_per_value = 8; break;
+-          }
++          // benefit(s) = Σ_γ calib(dev,γ,dtype)·count_γ·bpv over the four C3
++          // pattern classes; Dictionary counted but excluded from the cost.
+           constexpr auto gammas = std::array<const char*, 4>{"sequential", "monotonic", "random", "point"};
+           for (auto g = size_t{0}; g < 4; ++g) {
+             const auto accesses = static_cast<double>(c3_counts[g]);
+             c3_cost.first += _c3_calibration.at("dram").at(gammas[g]).at(calib_type) *
+                              accesses * static_cast<double>(c3_bytes_per_value);
+             c3_cost.second += _c3_calibration.at("cxl").at(gammas[g]).at(calib_type) *
+-                              accesses * static_cast<double>(c3_bytes_per_value);
++                             accesses * static_cast<double>(c3_bytes_per_value);
+           }
+           const auto pattern_total = c3_counts[0] + c3_counts[1] + c3_counts[2] + c3_counts[3];
+           if (pattern_total > max_c3_pattern_total) max_c3_pattern_total = pattern_total;
+@@ -821,17 +844,20 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+              fmt_double(kPlacementWVolume * norm_volume) + "," + fmt_double(kPlacementWImmutable * imm_score) +
+              "," + fmt_double(card) + "," + _plan_analyzer.operator_mask(seg.table_name, seg.column_id) + "," +
+              std::to_string(before) + "," + std::to_string(after);
+-      if (_c3_greedy) {
+-        // C3 columns: raw pattern counters + Dictionary handling + both cost
+-        // predictions. dictionary accesses are counted and reported but
+-        // excluded from the cost model (quantified separately by the harness).
+-        buf += "," + std::to_string(seg.c3_seq) + "," + std::to_string(seg.c3_monotonic) + "," +
+-               std::to_string(seg.c3_random) + "," + std::to_string(seg.c3_point) + "," +
+-               std::to_string(seg.c3_dictionary) + ",excluded_reported," +
+-               fmt_double(seg.c3_cost_dram) + "," + fmt_double(seg.c3_cost_cxl) + "\n";
+-      } else {
+-        buf += ",,,,,,,,\n";  // 8 empty c3-only columns (semantic policies)
+-      }
++      // [EDBT v4 B2] typed-counter tail columns for ALL policies: every row
++      // carries the five raw cumulative pattern counts (harness computes
++      // per-cycle deltas from them). cost_c3_greedy additionally reports the
++      // two cost predictions and dictionary_handling=excluded_reported (the
++      // C3 cost model excludes Dictionary). All other arms are observation-
++      // only here: dictionary_handling=observed_not_scored, costs empty —
++      // the counts never feed those arms' priorities.
++      buf += "," + std::to_string(seg.c3_seq) + "," + std::to_string(seg.c3_monotonic) + "," +
++             std::to_string(seg.c3_random) + "," + std::to_string(seg.c3_point) + "," +
++             std::to_string(seg.c3_dictionary) + "," +
++             (_c3_greedy ? std::string("excluded_reported") : std::string("observed_not_scored")) +
++             (_c3_greedy ? "," + fmt_double(seg.c3_cost_dram) + "," + fmt_double(seg.c3_cost_cxl)
++                         : ",,") +
++             "\n";
+     }
+     auto ofs = std::ofstream(_decision_trace_path, std::ios::app);
+     ofs << buf;
+@@ -1117,6 +1143,262 @@ std::string SemanticPlacementPlugin::trace_phase_label() const {
+   return static_cast<uint64_t>(now - start) < planned / 2 ? "timed_first_half" : "timed_second_half";
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────────────
++// [EDBT v4 B2] Single-client measured diagnostic pass (default OFF).
++// Runs between the initial placement and the daemon start, strictly sequential
++// (JOB CLI gates --placement_trace_measured to --clients 1), so a counter
++// delta around one query is a true measurement for that execution window.
++// PQP/benchmark metric availability inspected for this pass:
++//   * AbstractBenchmarkItemRunner::execute_item returns statement-level
++//     SQLPipelineMetrics only (no per-operator data) → not used here.
++//   * SQLPipeline::get_physical_plans() after execution exposes every
++//     operator's performance_data: walltime, output_row_count,
++//     output_chunk_count (measured). rows_in is derived as the input
++//     operator's output_row_count. There is NO per-operator segment access
++//     metric in this fork → operator-level actual_reads is filled only via
++//     the unique-scan attribution rule below, never fabricated.
++// ─────────────────────────────────────────────────────────────────────────────
++void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
++  using SAC = SegmentAccessCounter::AccessType;
++  auto& storage_manager = Hyrise::get().storage_manager;
++
++  const auto query_dir = std::filesystem::path(_plan_analyzer.query_dir());
++  if (!std::filesystem::exists(query_dir)) {
++    std::cout << "- [EDBT-MEASURED] diagnostic pass skipped (query dir not found: " << query_dir
++              << ")\n";
++    return;
++  }
++  auto sql_files = std::vector<std::filesystem::path>{};
++  for (const auto& entry : std::filesystem::directory_iterator(query_dir)) {
++    if (!entry.is_regular_file()) continue;
++    const auto& fpath = entry.path();
++    if (fpath.extension() != ".sql") continue;
++    const auto stem = fpath.stem().string();
++    if (stem == "schema" || stem == "fkindexes") continue;
++    sql_files.push_back(fpath);
++  }
++  std::sort(sql_files.begin(), sql_files.end());
++
++  _measured_segment_access_path = _decision_trace_path.substr(0, _decision_trace_path.size() -
++                                                                     std::string("_decision_trace.csv").size()) +
++                                  "_measured_segment_access.csv";
++  std::ofstream measured_ofs(_measured_segment_access_path);
++  measured_ofs << "run_id,config,rep,query_name,execution_id,table_name,chunk_id,column_id,"
++                  "sequential_delta,monotonic_delta,random_delta,point_delta,dictionary_delta,"
++                  "total_delta,tier_at_execution,attribution_level\n";
++  auto operator_ofs = std::ofstream(_operator_trace_path, std::ios::app);
++
++  // Snapshot every segment's five pattern counters (cumulative values).
++  const auto snapshot_counters = [&]() {
++    auto snap = std::unordered_map<SegmentKey, std::array<uint64_t, 5>, SegmentKeyHash>{};
++    snap.reserve(8192);
++    for (const auto& [table_name, table] : storage_manager.tables()) {
++      const auto chunk_count = table->chunk_count();
++      const auto column_count = table->column_count();
++      for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
++        const auto& chunk = table->get_chunk(chunk_id);
++        if (!chunk) continue;
++        for (auto col_id = ColumnID{0}; col_id < column_count; ++col_id) {
++          const auto& segment = chunk->get_segment(col_id);
++          if (!segment) continue;
++          const auto& counter = segment->access_counter;
++          snap[SegmentKey{table_name, chunk_id, col_id}] = {
++              counter[SAC::Sequential].load(std::memory_order_relaxed),
++              counter[SAC::Monotonic].load(std::memory_order_relaxed),
++              counter[SAC::Random].load(std::memory_order_relaxed),
++              counter[SAC::Point].load(std::memory_order_relaxed),
++              counter[SAC::Dictionary].load(std::memory_order_relaxed)};
++        }
++      }
++    }
++    return snap;
++  };
++
++  const auto tier_label = [&](const SegmentKey& key) -> const char* {
++    const auto it = _placement_map.find(key);
++    if (it == _placement_map.end()) return "UNKNOWN";
++    return it->second == Tier::CXL ? "CXL" : "DRAM";
++  };
++
++  // First PQPColumnExpression found in an expression tree (scan predicate column).
++  const auto find_pqp_column = [](const std::shared_ptr<AbstractExpression>& expression) {
++    std::function<const PQPColumnExpression*(const std::shared_ptr<AbstractExpression>&)> walk =
++        [&](const std::shared_ptr<AbstractExpression>& expr) -> const PQPColumnExpression* {
++      if (const auto* column = dynamic_cast<const PQPColumnExpression*>(expr.get())) return column;
++      for (const auto& argument : expr->arguments) {
++        if (const auto* column = walk(argument)) return column;
++      }
++      return nullptr;
++    };
++    return walk(expression);
++  };
++
++  auto measured_rows = size_t{0};
++  auto operator_rows = size_t{0};
++  for (const auto& sql_file : sql_files) {
++    auto ifstream = std::ifstream(sql_file);
++    if (!ifstream.is_open()) continue;
++    auto sql = std::string{};
++    auto line = std::string{};
++    while (std::getline(ifstream, line)) {
++      if (!line.empty() && line.back() == '\r') line.pop_back();
++      sql += line + "\n";
++    }
++    if (sql.empty()) continue;
++    const auto query_name = sql_file.stem().string();
++
++    const auto before = snapshot_counters();
++    auto pqp_roots = std::vector<std::shared_ptr<AbstractOperator>>{};
++    auto execution_ok = true;
++    try {
++      auto pipeline = SQLPipelineBuilder{sql}.create_pipeline();
++      const auto [status, result_table] = pipeline.get_result_table();  // executes; PQPs keep performance data
++      (void)result_table;
++      if (status != SQLPipelineStatus::Success) {
++        std::cout << "- [EDBT-MEASURED] warning: " << query_name << " pipeline status "
++                  << static_cast<int>(status) << "\n";
++        execution_ok = false;
++      } else {
++        pqp_roots = pipeline.get_physical_plans();
++      }
++    } catch (const std::exception& e) {
++      std::cout << "- [EDBT-MEASURED] warning: " << query_name << " failed: " << e.what() << "\n";
++      execution_ok = false;
++    }
++    const auto after = snapshot_counters();
++
++    if (!execution_ok) continue;
++
++    // Per-query measured counter deltas (exact: single client, sequential).
++    struct MeasuredDelta {
++      std::array<uint64_t, 5> patterns{};
++      uint64_t total = 0;
++    };
++    auto deltas = std::unordered_map<SegmentKey, MeasuredDelta, SegmentKeyHash>{};
++    for (const auto& [key, after_counts] : after) {
++      const auto it = before.find(key);
++      if (it == before.end()) continue;
++      auto delta = MeasuredDelta{};
++      for (auto p = size_t{0}; p < 5; ++p) {
++        delta.patterns[p] = after_counts[p] >= it->second[p] ? after_counts[p] - it->second[p] : 0;
++        delta.total += delta.patterns[p];
++      }
++      if (delta.total > 0) deltas.emplace(key, delta);
++    }
++    for (const auto& [key, delta] : deltas) {
++      measured_ofs << _trace_run_id << "," << _trace_config << "," << _trace_rep << "," << query_name
++                   << ",0," << key.table_name << "," << key.chunk_id << "," << key.column_id << ","
++                   << delta.patterns[0] << "," << delta.patterns[1] << "," << delta.patterns[2] << ","
++                   << delta.patterns[3] << "," << delta.patterns[4] << "," << delta.total << ","
++                   << tier_label(key) << ",measured_per_execution\n";
++      ++measured_rows;
++    }
++
++    // Operator rows: one per TableScan over a stored table (the memory-touching
++    // operator class). Collect scans per (table, column); actual_reads is the
++    // measured segment delta ONLY when exactly one scan of this query
++    // references that (table, column) — otherwise null.
++    struct ScanRef {
++      std::shared_ptr<AbstractOperator> scan;
++      std::shared_ptr<AbstractOperator> input;   // operator directly beneath (rows_in)
++      std::string table_name;
++      std::vector<ChunkID> pruned_chunks;
++    };
++    auto scans = std::vector<ScanRef>{};
++    auto column_of_scan = std::vector<std::optional<ColumnID>>{};
++
++    std::function<void(const std::shared_ptr<AbstractOperator>&)> collect_pqp =
++        [&](const std::shared_ptr<AbstractOperator>& op) {
++          if (!op) return;
++          if (op->name() == "TableScan") {
++            const auto scan = std::dynamic_pointer_cast<TableScan>(op);
++            const auto* column = scan ? find_pqp_column(scan->predicate()) : nullptr;
++            // Descend to the stored table beneath (through stacked scans / Validate).
++            auto base = scan ? scan->mutable_left_input() : nullptr;
++            while (base && (base->name() == "TableScan" || base->name() == "Validate")) {
++              base = base->mutable_left_input();
++            }
++            if (column && base && base->name() == "GetTable") {
++              const auto get_table = std::dynamic_pointer_cast<GetTable>(base);
++              if (get_table) {
++                scans.push_back(ScanRef{scan, scan->mutable_left_input(), get_table->table_name(),
++                                        get_table->pruned_chunk_ids()});
++                column_of_scan.push_back(column->column_id);
++              }
++            }
++          }
++          collect_pqp(op->mutable_left_input());
++          collect_pqp(op->mutable_right_input());
++        };
++    for (const auto& root : pqp_roots) collect_pqp(root);
++
++    // Count references per (table, column) across this query's scans.
++    auto reference_count = std::map<std::pair<std::string, ColumnID>, size_t>{};
++    for (auto i = size_t{0}; i < scans.size(); ++i) {
++      ++reference_count[{scans[i].table_name, column_of_scan[i].value()}];
++    }
++
++    for (auto i = size_t{0}; i < scans.size(); ++i) {
++      const auto& ref = scans[i];
++      const auto column_id = column_of_scan[i].value();
++      const auto unique = reference_count[{ref.table_name, column_id}] == 1;
++
++      const auto& scan_perf = *ref.scan->performance_data;
++      const auto rows_out = scan_perf.has_output ? scan_perf.output_row_count : 0;
++      auto rows_in = uint64_t{0};
++      if (ref.input && ref.input->performance_data->has_output) {
++        rows_in = ref.input->performance_data->output_row_count;
++      }
++      const auto wall_ns = static_cast<uint64_t>(scan_perf.walltime.count());
++
++      const auto pruned = std::set<ChunkID>(ref.pruned_chunks.begin(), ref.pruned_chunks.end());
++      if (!storage_manager.has_table(ref.table_name)) continue;
++      const auto chunk_count = storage_manager.get_table(ref.table_name)->chunk_count();
++      for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
++        if (pruned.count(chunk_id)) continue;
++        const SegmentKey key{ref.table_name, chunk_id, column_id};
++        // unique-scan rule: measured delta attributed to this scan only when
++        // this query has exactly one scan on (table, column); else null.
++        auto actual_reads = std::string{};
++        if (unique) {
++          const auto it = deltas.find(key);
++          if (it != deltas.end()) actual_reads = std::to_string(it->second.total);
++        }
++        operator_ofs << _trace_run_id << "," << _trace_config << "," << _trace_rep << "," << query_name
++                     << ",0," << i << ",TableScan," << ref.table_name << "," << chunk_id << ","
++                     << column_id << ",0," << rows_in << "," << rows_out << "," << wall_ns << ","
++                     << actual_reads << "," << tier_label(key) << ",measured_per_execution,,,,\n";
++        ++operator_rows;
++      }
++    }
++  }
++
++  std::cout << "- [EDBT-MEASURED] diagnostic pass: " << measured_rows
++            << " measured segment-delta rows, " << operator_rows
++            << " measured operator rows -> " << _measured_segment_access_path << "\n";
++
++  // Re-sync the daemon's baseline snapshots: the measured queries themselves
++  // bumped the cumulative counters, and daemon cycle 1's deltas must cover
++  // benchmark accesses only (same warm-start semantics as pre_benchmark_hook
++  // step 7 — cumulative counter as EMA seed / last-access baseline).
++  for (const auto& [table_name, table] : storage_manager.tables()) {
++    const auto chunk_count = table->chunk_count();
++    const auto column_count = table->column_count();
++    for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
++      const auto& chunk = table->get_chunk(chunk_id);
++      if (!chunk) continue;
++      for (auto col_id = ColumnID{0}; col_id < column_count; ++col_id) {
++        const auto& segment = chunk->get_segment(col_id);
++        if (!segment) continue;
++        const SegmentKey key{table_name, chunk_id, col_id};
++        const auto cumulative = get_segment_access_frequency(segment);
++        _last_access[key] = cumulative;
++        _ema_freq[key] = static_cast<double>(cumulative);
++      }
++    }
++  }
++}
++
+ // ─────────────────────────────────────────────────────────────────────────────
+ // P0-1/P0-2 (plan v2 §4): append one daemon_metrics.csv row for this cycle
+ // ─────────────────────────────────────────────────────────────────────────────
+diff --git a/src/plugins/semantic_placement_plugin.hpp b/src/plugins/semantic_placement_plugin.hpp
+index fc29f688c..106f8868a 100644
+--- a/src/plugins/semantic_placement_plugin.hpp
++++ b/src/plugins/semantic_placement_plugin.hpp
+@@ -222,6 +222,23 @@ class SemanticPlacementPlugin : public AbstractPlugin {
+   // pre_benchmark_hook when _trace_on. Also emits the [EDBT-TRACE] log line.
+   void init_trace(const std::string& json_path);
+ 
++  // ── EDBT v4 Phase B2: single-client measured diagnostic pass ──────────────
++  // Only when _trace_on && _trace_measured (JOB CLI gates --placement_trace +
++  // --clients 1). Runs after the initial placement (so tier_at_execution is
++  // the static _placement_map) and BEFORE the daemon thread starts: executes
++  // each workload query once, sequentially, snapshotting every segment's five
++  // pattern counters before/after. Emits:
++  //   <json>_measured_segment_access.csv — per (query, segment) counter deltas
++  //       (attribution_level=measured_per_execution; exact because sequential)
++  //   appended measured_per_execution rows in <json>_operator_segment_trace.csv
++  //       per PQP TableScan over a stored table: rows/wall from the executed
++  //       PQP performance data; actual_reads filled ONLY when exactly one scan
++  //       of that query references the segment's (table, column) — otherwise
++  //       null (operator association is never fabricated).
++  bool _trace_measured = false;
++  std::string _measured_segment_access_path;
++  void run_measured_diagnostic_pass();
++
+   // warmup | timed_first_half | timed_second_half (from the runner's anchors)
+   std::string trace_phase_label() const;
+ 
+-- 
+2.34.1
+

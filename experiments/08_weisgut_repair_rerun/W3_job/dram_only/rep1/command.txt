@@ -1,0 +1,1 @@
+numactl -N 1 -m 1 /home/dameng/CXL_migration/hyrise/build/hyriseBenchmarkJoinOrder --table_path imdb_data --queries all -m Shuffled --scheduler --cores 0 --dont_cache_binary_tables --clients 10 --time 600 --warmup 0 --schedule_seed 1001 -o /home/dameng/CXL_migration/hyrise/results_edbt_v4/08_weisgut_repair_rerun/W3_job/dram_only/rep1/benchmark.json

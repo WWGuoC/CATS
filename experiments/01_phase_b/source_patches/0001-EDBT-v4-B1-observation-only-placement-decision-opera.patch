@@ -1,0 +1,745 @@
+From 799a668da2ec0ab024c49fa155b62cc77b4aadcd Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Sun, 13 Sep 2026 23:19:31 +0800
+Subject: [PATCH 1/4] EDBT v4 B1: observation-only placement decision/operator
+ trace (--placement_trace, default off)
+
+- PlacementOptions.placement_trace (default false) + JOB CLI flag
+- decision_trace.csv: one row per considered segment per daemon cycle
+  (schemas/decision_trace.schema.json). Records v3 mapper semantics honestly
+  at this commit (boundary overshoot visible); raw features, all four weights
+  and weighted terms emitted separately so every row is recomputable to 1e-9.
+- operator_segment_trace.csv: plan_reference_only rows (no per-execution
+  attribution under clients=10; measured traffic fields empty by design)
+- timed-phase anchors in Hyrise singleton (warmup/timed_first_half/
+  timed_second_half labels); PlanAnalyzer operator-mask accumulation gated
+  on the trace flag; trace run identity from EDBT_V4_RUN_ID/EDBT_V4_REP
+- with the flag off every added branch is inert; trace-off equivalence vs
+  base commit 0f182ad07 proven before the B2 mapper change
+---
+ src/benchmark/join_order_benchmark.cpp    |  11 +-
+ src/benchmarklib/benchmark_runner.cpp     |   9 +
+ src/lib/hyrise.hpp                        |  26 +++
+ src/lib/types.hpp                         |  10 +
+ src/plugins/plan_analyzer.cpp             | 158 +++++++++++++++-
+ src/plugins/plan_analyzer.hpp             |  29 ++-
+ src/plugins/semantic_placement_plugin.cpp | 211 +++++++++++++++++++++-
+ src/plugins/semantic_placement_plugin.hpp |  23 +++
+ 8 files changed, 468 insertions(+), 9 deletions(-)
+
+diff --git a/src/benchmark/join_order_benchmark.cpp b/src/benchmark/join_order_benchmark.cpp
+index 16e4c51ac..d42f63ea9 100644
+--- a/src/benchmark/join_order_benchmark.cpp
++++ b/src/benchmark/join_order_benchmark.cpp
+@@ -175,7 +175,11 @@ int main(int argc, char* argv[]) {
+                       "(cost = semantic score table); E8 arm", cxxopts::value<bool>()->default_value("false")) // NOLINT
+   ("placement_kappa", "[IMPL-4] Cardinality-estimate perturbation factor kappa (multiplied into every "
+                       "optimizer cardinality estimate the Plan Analyzer reads); E9B arm; 1.0 = identity",
+-                      cxxopts::value<float>()->default_value("1.0")); // NOLINT
++                      cxxopts::value<float>()->default_value("1.0")) // NOLINT
++  ("placement_trace", "[EDBT v4 B1] Observation-only placement trace (default off). Writes "
++                      "<json>_decision_trace.csv + <json>_operator_segment_trace.csv; run identity "
++                      "from EDBT_V4_RUN_ID / EDBT_V4_REP env vars",
++                      cxxopts::value<bool>()->default_value("false")); // NOLINT
+   // clang-format on
+ 
+   auto benchmark_config = std::shared_ptr<BenchmarkConfig>{};
+@@ -202,6 +206,7 @@ int main(int argc, char* argv[]) {
+   auto placement_freeze = false;
+   auto placement_wfreq = false;
+   auto placement_kappa = 1.0f;
++  auto placement_trace = false;
+ 
+   // Parse command line args
+   const auto cli_parse_result = cli_options.parse(argc, argv);
+@@ -242,6 +247,7 @@ int main(int argc, char* argv[]) {
+   placement_freeze = cli_parse_result["placement_freeze"].as<bool>();
+   placement_wfreq = cli_parse_result["placement_wfreq"].as<bool>();
+   placement_kappa = cli_parse_result["placement_kappa"].as<float>();
++  placement_trace = cli_parse_result["placement_trace"].as<bool>();
+ 
+   // Check that the options "query_path" and "table_path" were specified
+   if (query_path.empty() || table_path.empty()) {
+@@ -365,7 +371,8 @@ int main(int argc, char* argv[]) {
+                                      .placement_freeze_at_timed_start = placement_freeze,
+                                      .placement_wfreq = placement_wfreq,
+                                      .placement_kappa = placement_kappa,
+-                                     .placement_query_path = query_path};
++                                     .placement_query_path = query_path,
++                                     .placement_trace = placement_trace};
+ 
+   auto context = BenchmarkRunner::create_context(*benchmark_config);
+   auto table_generator = std::make_unique<FileBasedTableGenerator>(benchmark_config, table_path);
+diff --git a/src/benchmarklib/benchmark_runner.cpp b/src/benchmarklib/benchmark_runner.cpp
+index c4a21d408..d630e5752 100644
+--- a/src/benchmarklib/benchmark_runner.cpp
++++ b/src/benchmarklib/benchmark_runner.cpp
+@@ -318,6 +318,15 @@ void BenchmarkRunner::_benchmark_shuffled() {
+ 
+   _state = BenchmarkState{_config.max_duration};
+   const auto timed_phase_start = std::chrono::steady_clock::now();
++  // EDBT v4 Phase B (commit B1): publish timed-phase anchors so the placement
++  // daemon can label decision_trace rows warmup/timed_first_half/timed_second_half.
++  // Two relaxed atomic stores at timed-phase start; off any decision path.
++  Hyrise::get().timed_phase_start_steady_ns.store(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(timed_phase_start.time_since_epoch()).count(),
++      std::memory_order_relaxed);
++  Hyrise::get().timed_phase_planned_duration_ns.store(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(_config.max_duration).count(),
++      std::memory_order_relaxed);
+   // [IMPL-1] (plan v3 §4): freeze placement at the first instant of the timed phase.
+   // Warmup-phase placement (dram_first, budget-clamped) has finished by now; the
+   // semantic daemon switches to pure-measurement cycles from this point on. The
+diff --git a/src/lib/hyrise.hpp b/src/lib/hyrise.hpp
+index 3466af6e1..7ab1085d9 100644
+--- a/src/lib/hyrise.hpp
++++ b/src/lib/hyrise.hpp
+@@ -74,6 +74,32 @@ class Hyrise : public Singleton<Hyrise> {
+   };
+   MovableAtomicBool placement_frozen;
+ 
++  // EDBT v4 Phase B (commit B1): timed-phase anchors, set by the BenchmarkRunner
++  // at the first instant of the Shuffled timed phase (unconditionally; two atomic
++  // stores off the decision path). The SemanticPlacementPlugin daemon reads them
++  // to label every decision_trace row warmup / timed_first_half / timed_second_half.
++  // -1 (start) / 0 (planned duration) = warmup / unknown duration.
++  // Movable wrappers for the same reason as placement_frozen above.
++  template <typename T>
++  struct MovableAtomic {
++    std::atomic<T> value{};
++    MovableAtomic() = default;
++    explicit MovableAtomic(T initial) {
++      value.store(initial, std::memory_order_relaxed);
++    }
++    MovableAtomic(MovableAtomic&& other) noexcept {
++      value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
++    }
++    MovableAtomic& operator=(MovableAtomic&& other) noexcept {
++      value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
++      return *this;
++    }
++    void store(T desired, std::memory_order order = std::memory_order_seq_cst) { value.store(desired, order); }
++    T load(std::memory_order order = std::memory_order_seq_cst) const { return value.load(order); }
++  };
++  MovableAtomic<int64_t> timed_phase_start_steady_ns{-1};
++  MovableAtomic<uint64_t> timed_phase_planned_duration_ns{0};
++
+   StorageManager storage_manager;
+   PluginManager plugin_manager;
+   TransactionManager transaction_manager;
+diff --git a/src/lib/types.hpp b/src/lib/types.hpp
+index 3b2dbe210..b00179bed 100644
+--- a/src/lib/types.hpp
++++ b/src/lib/types.hpp
+@@ -114,6 +114,16 @@ struct PlacementOptions {
+   // set to the benchmark's actual --query_path so plan analysis follows the
+   // workload being run (synthetic mixed-workload driver).
+   std::string placement_query_path;
++  // EDBT v4 Phase B (commit B1): observation-only placement trace, default OFF.
++  // When false, every code path added for the trace is inert (trace-off decision
++  // equivalence vs the base commit is proven before any mapper change lands).
++  // When true, the SemanticPlacementPlugin writes <json>_decision_trace.csv
++  // (one row per considered segment per daemon cycle) and
++  // <json>_operator_segment_trace.csv (plan_reference_only rows) next to the
++  // benchmark JSON output. Run identity for the CSV rows comes from the
++  // EDBT_V4_RUN_ID / EDBT_V4_REP environment variables (harness-controlled),
++  // defaulting to the JSON file stem and rep 1.
++  bool placement_trace = false;
+ };
+ 
+ // The string type that is used internally to store data. It's hard to draw the line between this and std::string or
+diff --git a/src/plugins/plan_analyzer.cpp b/src/plugins/plan_analyzer.cpp
+index 28fcd0337..c1a5ccb95 100644
+--- a/src/plugins/plan_analyzer.cpp
++++ b/src/plugins/plan_analyzer.cpp
+@@ -492,8 +492,12 @@ void PlanAnalyzer::traverse_lqp(const std::shared_ptr<AbstractLQPNode>& root,
+     const auto& pruned_chunks = stored_table_node->pruned_chunk_ids();
+     const auto& pruned_cols = stored_table_node->pruned_column_ids();
+ 
+-    // Classify the access type by walking upward to the consuming operator
+-    const auto access_type = classify_access_type(stored_table_node);
++    // Classify the access type by walking upward to the consuming operator.
++    // EDBT v4 Phase B (B1): with the trace flag on we additionally record the
++    // consuming operator's LQP node type per column (observation-only).
++    auto consumer_name = std::string{};
++    const auto trace_on = Hyrise::get().placement_options.placement_trace;
++    const auto access_type = classify_access_type(stored_table_node, trace_on ? &consumer_name : nullptr);
+ 
+     // Estimate cardinality from the node's statistics
+     // [IMPL-4] (E9B): multiply the optimizer cardinality estimate by kappa at
+@@ -515,6 +519,11 @@ void PlanAnalyzer::traverse_lqp(const std::shared_ptr<AbstractLQPNode>& root,
+     for (auto col_id = ColumnID{0}; col_id < column_count; ++col_id) {
+       if (pruned_col_set.count(col_id)) continue;  // pruned → not accessed
+ 
++      if (trace_on) {
++        // EDBT v4 Phase B (B1): observation-only operator mask accumulation.
++        _column_operator_names[table_name + ":" + std::to_string(col_id)].insert(consumer_name);
++      }
++
+       auto signal = ColumnAccessSignal{};
+       signal.table_name = table_name;
+       signal.column_id = col_id;
+@@ -530,12 +539,20 @@ void PlanAnalyzer::traverse_lqp(const std::shared_ptr<AbstractLQPNode>& root,
+ // Classify access type by walking upward from StoredTableNode to the first
+ // consuming operator (Predicate/Join/Aggregate/Sort), skipping Projection,
+ // Validate, Limit, Alias nodes.
++// EDBT v4 Phase B (B1): optional consumer_name out-param (observation-only,
++// used by the operator trace / operator_mask). Passing nullptr keeps the
++// placement path bit-identical to the previous single-return form.
+ // ─────────────────────────────────────────────────────────────────────────────
+-AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPNode>& stored_table_node) {
++AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPNode>& stored_table_node,
++                                              std::string* consumer_name) {
+   // Walk upward via outputs()
+   auto current = stored_table_node;
+   auto visited = std::set<std::shared_ptr<AbstractLQPNode>>{};
+ 
++  const auto set_consumer = [consumer_name](const char* name) {
++    if (consumer_name) *consumer_name = name;
++  };
++
+   while (!current->outputs().empty()) {
+     auto found_consumer = false;
+     for (const auto& output : current->outputs()) {
+@@ -544,6 +561,7 @@ AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPN
+ 
+       switch (output->type) {
+         case LQPNodeType::Predicate: {
++          set_consumer("Predicate");
+           // Check if it's a point lookup (Equals) or a range scan
+           auto pred_node = std::dynamic_pointer_cast<PredicateNode>(output);
+           if (pred_node && pred_node->predicate()) {
+@@ -555,6 +573,7 @@ AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPN
+           return AccessType::Scan;
+         }
+         case LQPNodeType::Join: {
++          set_consumer("Join");
+           // Determine if this table is on the build (left) or probe (right) side
+           auto join_node = std::dynamic_pointer_cast<JoinNode>(output);
+           if (join_node) {
+@@ -567,8 +586,10 @@ AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPN
+           return AccessType::Scan;
+         }
+         case LQPNodeType::Aggregate:
++          set_consumer("Aggregate");
+           return AccessType::Aggregate;
+         case LQPNodeType::Sort:
++          set_consumer("Sort");
+           return AccessType::Sort;
+         case LQPNodeType::Projection:
+         case LQPNodeType::Validate:
+@@ -579,6 +600,7 @@ AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPN
+           found_consumer = true;
+           break;
+         default:
++          set_consumer("Other");
+           // Unknown operator type — treat as generic scan
+           return AccessType::Scan;
+       }
+@@ -587,6 +609,7 @@ AccessType PlanAnalyzer::classify_access_type(const std::shared_ptr<AbstractLQPN
+     if (!found_consumer) break;
+   }
+ 
++  set_consumer("None");
+   return AccessType::Unknown;
+ }
+ 
+@@ -661,4 +684,133 @@ uint64_t PlanAnalyzer::get_access_frequency(const std::shared_ptr<AbstractSegmen
+          counter[SegmentAccessCounter::AccessType::Dictionary].load(std::memory_order_relaxed);
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────────────
++// EDBT v4 Phase B (commit B1): operator mask lookup (observation-only)
++// ─────────────────────────────────────────────────────────────────────────────
++const std::string& PlanAnalyzer::operator_mask(const std::string& table_name, ColumnID column_id) const {
++  static const std::string no_mask = "-";
++  const auto key = table_name + ":" + std::to_string(column_id);
++  const auto it = _column_operator_names.find(key);
++  if (it == _column_operator_names.end() || it->second.empty()) return no_mask;
++  const auto cached = _column_operator_masks.find(key);
++  if (cached != _column_operator_masks.end()) return cached->second;
++  auto joined = std::string{};
++  for (const auto& name : it->second) {
++    if (!joined.empty()) joined += "|";
++    joined += name;
++  }
++  return _column_operator_masks.emplace(key, std::move(joined)).first->second;
++}
++
++// ─────────────────────────────────────────────────────────────────────────────
++// EDBT v4 Phase B (commit B1): operator/segment reference trace
++// (schemas/operator_segment_trace.schema.json, plan_reference_only rows).
++// Per-execution attribution is not measurable under clients=10 concurrency and
++// the fork carries no hardware traffic counters per operator, so every row
++// declares attribution_level=plan_reference_only and leaves the measured
++// traffic fields (actual_reads, dram/cxl accesses/bytes) empty. Rows connect
++// each JOB query's consuming operators to the segments they reference
++// (chunk-pruning-aware). operator_wall_ns / rows_in / rows_out are 0 = not
++// measured (declared in the Phase B POLICY_SPEC).
++// ─────────────────────────────────────────────────────────────────────────────
++void PlanAnalyzer::write_operator_reference_trace(const std::string& path, const std::string& run_id,
++                                                  const std::string& config, uint32_t rep) {
++  auto& storage_manager = Hyrise::get().storage_manager;
++  const auto has_job = storage_manager.has_table("title");
++  if (!has_job) {
++    std::cout << "- [EDBT-TRACE] operator reference trace skipped (no JOB tables loaded)\n";
++    return;
++  }
++
++  const auto query_dir = std::filesystem::path(_query_dir);
++  if (!std::filesystem::exists(query_dir)) {
++    std::cout << "- [EDBT-TRACE] operator reference trace skipped (query dir not found: " << query_dir << ")\n";
++    return;
++  }
++
++  auto sql_files = std::vector<std::filesystem::path>{};
++  for (const auto& entry : std::filesystem::directory_iterator(query_dir)) {
++    if (!entry.is_regular_file()) continue;
++    const auto& fpath = entry.path();
++    if (fpath.extension() != ".sql") continue;
++    const auto stem = fpath.stem().string();
++    if (stem == "schema" || stem == "fkindexes") continue;
++    sql_files.push_back(fpath);
++  }
++  std::sort(sql_files.begin(), sql_files.end());
++
++  auto ofs = std::ofstream(path);
++  if (!ofs.is_open()) {
++    std::cout << "- [EDBT-TRACE] cannot open operator trace output " << path << "\n";
++    return;
++  }
++  ofs << "run_id,config,rep,query_name,execution_id,operator_id,operator_type,table_name,"
++         "chunk_id,column_id,estimated_rows,rows_in,rows_out,operator_wall_ns,actual_reads,"
++         "tier_at_execution,attribution_level,dram_accesses,cxl_accesses,dram_bytes,cxl_bytes\n";
++
++  auto total_rows = size_t{0};
++  for (const auto& sql_file : sql_files) {
++    auto ifstream = std::ifstream(sql_file);
++    if (!ifstream.is_open()) continue;
++    auto sql = std::string{};
++    auto line = std::string{};
++    while (std::getline(ifstream, line)) {
++      if (!line.empty() && line.back() == '\r') line.pop_back();
++      sql += line + "\n";
++    }
++    if (sql.empty()) continue;
++
++    const auto query_name = sql_file.stem().string();
++    try {
++      auto pipeline = SQLPipelineBuilder{sql}.create_pipeline();
++      const auto& optimized_lqps = pipeline.get_optimized_logical_plans();
++      auto operator_id = size_t{0};
++      for (const auto& lqp : optimized_lqps) {
++        if (!lqp) continue;
++        const auto stored_table_nodes = lqp_find_nodes_by_type(lqp, LQPNodeType::StoredTable);
++        for (const auto& node : stored_table_nodes) {
++          auto stored_table_node = std::dynamic_pointer_cast<StoredTableNode>(node);
++          if (!stored_table_node) continue;
++          const auto& table_name = stored_table_node->table_name;
++          if (!storage_manager.has_table(table_name)) continue;
++          const auto& table = storage_manager.get_table(table_name);
++
++          auto consumer_name = std::string{};
++          const auto access_type = classify_access_type(stored_table_node, &consumer_name);
++          (void)access_type;  // operator_type carries the raw consumer; atype stays a placement signal
++
++          auto cardinality = 0.0f;
++          if (stored_table_node->table_statistics) {
++            cardinality = stored_table_node->table_statistics->row_count * _kappa;
++          }
++
++          const auto& pruned_chunks = stored_table_node->pruned_chunk_ids();
++          const auto pruned_chunk_set = std::set<ChunkID>(pruned_chunks.begin(), pruned_chunks.end());
++          const auto& pruned_cols = stored_table_node->pruned_column_ids();
++          const auto pruned_col_set = std::set<ColumnID>(pruned_cols.begin(), pruned_cols.end());
++
++          const auto chunk_count = table->chunk_count();
++          const auto column_count = table->column_count();
++          for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
++            if (pruned_chunk_set.count(chunk_id)) continue;
++            for (auto col_id = ColumnID{0}; col_id < column_count; ++col_id) {
++              if (pruned_col_set.count(col_id)) continue;
++              ofs << run_id << "," << config << "," << rep << "," << query_name << ",0," << operator_id
++                  << "," << consumer_name << "," << table_name << "," << chunk_id << "," << col_id << ","
++                  << cardinality << ",0,0,0,,UNKNOWN,plan_reference_only,,,,\n";
++              ++total_rows;
++            }
++          }
++          ++operator_id;
++        }
++      }
++    } catch (const std::exception& e) {
++      std::cout << "- [EDBT-TRACE] warning: no operator rows for " << query_name << ": " << e.what() << "\n";
++    }
++  }
++
++  std::cout << "- [EDBT-TRACE] operator reference trace: " << total_rows << " plan_reference_only rows ("
++            << sql_files.size() << " queries) -> " << path << "\n";
++}
++
+ }  // namespace hyrise
+diff --git a/src/plugins/plan_analyzer.hpp b/src/plugins/plan_analyzer.hpp
+index 9510b792b..a3c569faa 100644
+--- a/src/plugins/plan_analyzer.hpp
++++ b/src/plugins/plan_analyzer.hpp
+@@ -1,7 +1,9 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <map>
+ #include <memory>
++#include <set>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -62,6 +64,23 @@ class PlanAnalyzer {
+   void set_query_dir(const std::string& dir) { _query_dir = dir; }
+   const std::string& query_dir() const { return _query_dir; }
+ 
++  // EDBT v4 Phase B (commit B1) ------------------------------------------------
++  // Union of LQP consuming-operator names for a column, accumulated during
++  // analyze_lqps() ONLY when placement_options.placement_trace is on (pure
++  // observation; never read by the placement pipeline). Returns "-" when the
++  // column was never classified (ablate_d1 arm / unreferenced column).
++  const std::string& operator_mask(const std::string& table_name, ColumnID column_id) const;
++
++  // EDBT v4 Phase B (commit B1): write the operator/segment reference trace
++  // (schemas/operator_segment_trace.schema.json) as plan_reference_only rows —
++  // one row per (query, StoredTableNode occurrence, referenced chunk, unpruned
++  // column). Per-execution attribution is not measurable under clients=10
++  // concurrency, so measured traffic fields stay empty and every row declares
++  // attribution_level=plan_reference_only. Observation-only: not part of the
++  // placement pipeline.
++  void write_operator_reference_trace(const std::string& path, const std::string& run_id,
++                                      const std::string& config, uint32_t rep);
++
+  private:
+   // Stage 1: Plan Analyzer — build SQL pipelines, traverse LQPs, extract
+   // (table_name, column_id, access_type, cardinality) per query.
+@@ -82,6 +101,12 @@ class PlanAnalyzer {
+   // [IMPL-5] JOB query directory (see set_query_dir); default = wave-1 path
+   std::string _query_dir = "third_party/join-order-benchmark";
+ 
++  // EDBT v4 Phase B (B1): per-column set of consuming-operator names, filled by
++  // traverse_lqp only when placement_options.placement_trace is on. Lazily
++  // joined into '|'-separated strings by operator_mask().
++  mutable std::map<std::string, std::set<std::string>> _column_operator_names;
++  mutable std::map<std::string, std::string> _column_operator_masks;
++
+   // Build SQL pipelines for TPC-H queries (using deterministic parameters).
+   std::vector<std::shared_ptr<AbstractLQPNode>> build_tpch_lqps();
+ 
+@@ -97,7 +122,9 @@ class PlanAnalyzer {
+ 
+   // Classify the access type for a StoredTableNode by walking upward to the
+   // first consuming operator (Predicate/Join/Aggregate/Sort).
+-  AccessType classify_access_type(const std::shared_ptr<AbstractLQPNode>& stored_table_node);
++  // EDBT v4 Phase B (B1): optional consumer_name out-param (observation-only).
++  AccessType classify_access_type(const std::shared_ptr<AbstractLQPNode>& stored_table_node,
++                                  std::string* consumer_name = nullptr);
+ 
+   // Stage 2: Object Resolver — expand (table, pruned_chunk_ids, column_id)
+   // into concrete (table, chunk_id, column_id) segment lists.
+diff --git a/src/plugins/semantic_placement_plugin.cpp b/src/plugins/semantic_placement_plugin.cpp
+index be88e100b..5bcf0a68d 100644
+--- a/src/plugins/semantic_placement_plugin.cpp
++++ b/src/plugins/semantic_placement_plugin.cpp
+@@ -1,8 +1,11 @@
+ #include "semantic_placement_plugin.hpp"
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <ctime>
+ #include <fstream>
+ #include <iostream>
+@@ -199,6 +202,18 @@ std::optional<PreBenchmarkHook> SemanticPlacementPlugin::pre_benchmark_hook() {
+       std::cout << "- Replica (zero-copy demote): DISABLED (ablation)\n";
+     }
+ 
++    // EDBT v4 Phase B (B1): observation-only trace setup (default off; inert
++    // for every decision/migration path when the flag is absent).
++    _trace_on = options.placement_trace;
++    if (_trace_on) {
++      init_trace(options.json_path);
++      for (const auto& d : decisions) {
++        _trace_cardinality[{d.table_name, d.chunk_id, d.column_id}] = d.estimated_cardinality;
++      }
++      _plan_analyzer.write_operator_reference_trace(_operator_trace_path, _trace_run_id, _trace_config,
++                                                    _trace_rep);
++    }
++
+     // 8. Start daemon thread (if enabled)
+     if (_daemon_period_seconds > 0) {
+       // P0-1: initialize per-cycle daemon metrics CSV (same dir as benchmark JSON)
+@@ -494,6 +509,10 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+   // Compute P(s) priority for each segment and sort descending
+   auto priorities = std::vector<double>{};
+   priorities.reserve(segments.size());
++  // Hoisted (EDBT v4 B1) so the observation-only trace emitter below can read
++  // the frequency arm's effective inputs; behavior identical.
++  auto freq_w = std::vector<uint64_t>{};
++  auto max_freq_w = uint64_t{0};
+   if (_wfreq) {
+     // [IMPL-2] (plan v3 §4, formula A): cost-weighted frequency arm. freq_w(s) =
+     // Σ_a cost(atype(a)); with the per-segment tracked type this equals
+@@ -501,8 +520,7 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+     // compute_priority with atype=Unknown (constant 0.5 baseline, exactly like the
+     // frequency arm's neutralization) and the frequency input replaced by freq_w
+     // normalized by this round's max. Semantic/frequency arm paths untouched.
+-    auto freq_w = std::vector<uint64_t>(segments.size());
+-    uint64_t max_freq_w = 0;
++    freq_w = std::vector<uint64_t>(segments.size());
+     for (size_t i = 0; i < segments.size(); ++i) {
+       // cost table MUST stay identical to compute_priority's atype_score switch
+       double cost = 0.5;
+@@ -574,7 +592,7 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+   // demote时利用已有CXL副本只修改映射(零拷贝), 释放DRAM中的副本
+   auto demoted_this_cycle = size_t{0};
+   for (size_t i = indices.size(); i > hot_threshold; --i) {
+-    const auto& seg = segments[indices[i - 1]];
++    const auto& seg = segments[i - 1];
+     if (seg.current_tier != Tier::Local) continue;  // 已在 CXL，无需迁移
+     if (demote_segment(seg.table_name, seg.chunk_id, seg.column_id)) {
+       ++demoted_this_cycle;
+@@ -582,6 +600,146 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+     }
+   }
+ 
++  // ── EDBT v4 Phase B (B1): observation-only decision trace ──────────────────
++  // One row per considered segment per cycle (schemas/decision_trace.schema.json).
++  // This commit records the v3 mapper semantics honestly: selection is the
++  // capacity-accumulation hot set, and the boundary segment can push the logical
++  // total past the budget (visible as selected=true with fits_remaining=false);
++  // commit B2 replaces this rule with the shared deterministic strict-fit mapper
++  // for ALL migration policies. Inert when --placement_trace is off.
++  if (_trace_on) {
++    const auto policy = std::string{_ablate_d1 ? "our_no_plan" : "our_full"};
++    const auto phase = trace_phase_label();
++    auto ts = timespec{};
++    clock_gettime(CLOCK_REALTIME, &ts);
++    const auto unix_ts_ns =
++        static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
++
++    // Effective priority inputs of the active arm (wfreq replaces the rate and
++    // neutralizes the atype term exactly like compute_priority's callers do).
++    const auto max_rate_used = _wfreq ? max_freq_w : max_rate;
++    const auto atype_name = [](AccessType t) -> const char* {
++      switch (t) {
++        case AccessType::Aggregate:   return "Aggregate";
++        case AccessType::HashBuild:   return "HashBuild";
++        case AccessType::PointLookup: return "PointLookup";
++        case AccessType::HashProbe:   return "HashProbe";
++        case AccessType::Scan:        return "Scan";
++        case AccessType::Sort:        return "Sort";
++        case AccessType::Unknown:     return "Unknown";
++      }
++      return "Unknown";
++    };
++    const auto atype_score_of = [](AccessType t) -> double {
++      switch (t) {
++        case AccessType::Aggregate:   return 1.0;
++        case AccessType::HashBuild:   return 0.8;
++        case AccessType::PointLookup: return 0.7;
++        case AccessType::HashProbe:   return 0.6;
++        case AccessType::Scan:        return 0.5;
++        case AccessType::Sort:        return 0.4;
++        case AccessType::Unknown:     return 0.5;
++      }
++      return 0.5;
++    };
++    const auto fmt_double = [](double v) {
++      auto out = std::array<char, 40>{};
++      std::snprintf(out.data(), out.size(), "%.17g", v);
++      return std::string{out.data()};
++    };
++    const auto dtype_name_of = [](DataType t) -> const char* {
++      switch (t) {
++        case DataType::Int:    return "int";
++        case DataType::Long:   return "long";
++        case DataType::Float:  return "float";
++        case DataType::Double: return "double";
++        case DataType::String: return "string";
++        case DataType::Null:   return "null";
++      }
++      return "null";
++    };
++    const auto dtype_bytes_of = [](DataType t) -> uint64_t {
++      switch (t) {
++        case DataType::Int:    return 4;
++        case DataType::Long:   return 8;
++        case DataType::Float:  return 4;
++        case DataType::Double: return 8;
++        case DataType::String: return 16;  // sizeof(pmr_string); variable-length payload excluded
++        case DataType::Null:   return 8;
++      }
++      return 8;
++    };
++
++    auto& trace_sm = Hyrise::get().storage_manager;
++    auto buf = std::string{};
++    buf.reserve(segments.size() * 224);
++    auto trace_accumulated = uint64_t{0};
++    for (auto r = size_t{0}; r < indices.size(); ++r) {
++      const auto idx = indices[r];
++      const auto& seg = segments[idx];
++      const auto selected = r < hot_threshold;
++      const auto before = trace_accumulated >= dram_capacity ? uint64_t{0} : dram_capacity - trace_accumulated;
++      const auto fits = seg.data_volume <= before;
++      if (selected) trace_accumulated += seg.data_volume;
++      const auto after = trace_accumulated >= dram_capacity ? uint64_t{0} : dram_capacity - trace_accumulated;
++
++      const char* action;
++      const char* target;
++      if (selected) {
++        if (seg.current_tier == Tier::CXL) {
++          action = "promote";
++          target = "DRAM";
++        } else {
++          action = "keep";
++          target = "UNCHANGED";
++        }
++      } else if (seg.current_tier == Tier::Local) {
++        action = "demote";
++        target = "CXL";
++      } else {
++        action = "keep";
++        target = "UNCHANGED";
++      }
++
++      // Features exactly as evaluated by compute_priority (same expressions).
++      const auto atype = _wfreq ? AccessType::Unknown : seg.access_type;
++      const auto rate_raw = _wfreq ? freq_w[idx] : seg.access_rate;
++      const auto norm_freq = max_rate_used > 0 ? static_cast<double>(rate_raw) / max_rate_used : 0.0;
++      const auto norm_volume = max_volume > 0 ? 1.0 - static_cast<double>(seg.data_volume) / max_volume : 0.5;
++      const auto a_score = atype_score_of(atype);
++      const auto imm_score = seg.is_immutable ? 1.0 : 0.0;
++
++      const auto dtype = trace_sm.has_table(seg.table_name)
++                             ? trace_sm.get_table(seg.table_name)->column_data_type(seg.column_id)
++                             : DataType::Null;
++      const auto card_it = _trace_cardinality.find({seg.table_name, seg.chunk_id, seg.column_id});
++      const auto card = card_it == _trace_cardinality.end() ? 0.0 : static_cast<double>(card_it->second);
++
++      buf += _trace_run_id;
++      buf += "," + _trace_config + "," + std::to_string(_trace_rep) + "," + std::to_string(unix_ts_ns) +
++             "," + std::to_string(_daemon_cycles) + "," + phase + "," + seg.table_name + "," +
++             std::to_string(seg.chunk_id) + "," + std::to_string(seg.column_id) + "," +
++             std::to_string(seg.data_volume) + "," + (seg.current_tier == Tier::CXL ? "CXL" : "DRAM") + "," +
++             target + "," + std::string(action) + "," + (selected ? "true" : "false") + "," + std::to_string(r) +
++             "," + (fits ? "true" : "false") + "," + policy + "," + dtype_name_of(dtype) + "," +
++             std::to_string(dtype_bytes_of(dtype)) + "," + fmt_double(priorities[idx]) + "," +
++             std::to_string(rate_raw) + "," + std::to_string(max_rate_used) + "," + fmt_double(norm_freq) + "," +
++             atype_name(atype) + "," + fmt_double(a_score) + "," + std::to_string(seg.data_volume) + "," +
++             std::to_string(max_volume) + "," + fmt_double(norm_volume) + "," +
++             (seg.is_immutable ? "true" : "false") + "," + fmt_double(imm_score) + "," +
++             fmt_double(kPlacementWAtype) + "," + fmt_double(kPlacementWFreq) + "," +
++             fmt_double(kPlacementWVolume) + "," + fmt_double(kPlacementWImmutable) + "," +
++             fmt_double(kPlacementWAtype * a_score) + "," + fmt_double(kPlacementWFreq * norm_freq) + "," +
++             fmt_double(kPlacementWVolume * norm_volume) + "," + fmt_double(kPlacementWImmutable * imm_score) +
++             "," + fmt_double(card) + "," + _plan_analyzer.operator_mask(seg.table_name, seg.column_id) + "," +
++             std::to_string(before) + "," + std::to_string(after) +
++             ",,,,,,\n";  // typed counts / dictionary_handling / cost_*: B3 (cost_c3_greedy) fills these
++    }
++    auto ofs = std::ofstream(_decision_trace_path, std::ios::app);
++    ofs << buf;
++  }
++
++
+   // GC: 回收不属于热段(DRAM)的CXL副本（迁移后同步回收）
+   // demote后, 被demote段的CXL副本已成为主拷贝(不再需要作为副本保留)
+   auto gc_count = size_t{0};
+@@ -612,6 +770,53 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+                             snap_bytes_promoted, snap_bytes_demoted, cpu_t0, cycle_wall_start);
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────────────
++// EDBT v4 Phase B (commit B1): observation-only trace setup
++// ─────────────────────────────────────────────────────────────────────────────
++void SemanticPlacementPlugin::init_trace(const std::string& json_path) {
++  constexpr auto dot_json_length = 5u;  // length of ".json"
++  const auto stem = json_path.substr(0, json_path.size() - dot_json_length);
++  _decision_trace_path = stem + "_decision_trace.csv";
++  _operator_trace_path = stem + "_operator_segment_trace.csv";
++  _trace_config = _ablate_d1 ? "our_freq" : "our_full";  // commit B3 adds cost_c3_greedy
++
++  // Run identity: harness-controlled env with JSON-stem / rep-1 defaults.
++  if (const auto* env_run_id = std::getenv("EDBT_V4_RUN_ID")) {
++    _trace_run_id = env_run_id;
++  }
++  if (_trace_run_id.empty()) {
++    const auto last_slash = stem.find_last_of('/');
++    _trace_run_id = last_slash == std::string::npos ? stem : stem.substr(last_slash + 1);
++  }
++  if (const auto* env_rep = std::getenv("EDBT_V4_REP")) {
++    _trace_rep = static_cast<uint32_t>(std::strtoul(env_rep, nullptr, 10));
++  }
++
++  {
++    auto ofs = std::ofstream(_decision_trace_path);
++    ofs << "run_id,config,rep,unix_ts_ns,cycle_id,phase,table_name,chunk_id,column_id,"
++           "segment_bytes,source_tier,target_tier,action,selected,rank,fits_remaining,"
++           "policy,data_type,bytes_per_value,total_score,access_rate_raw,max_rate,norm_freq,"
++           "access_type,atype_score,data_volume_bytes,max_volume_bytes,norm_volume,is_immutable,"
++           "immutable_score,weight_atype,weight_freq,weight_volume,weight_immutable,term_atype,"
++           "term_freq,term_volume,term_immutable,estimated_cardinality,operator_mask,"
++           "remaining_budget_before,remaining_budget_after,sequential_count,monotonic_count,"
++           "random_count,point_count,dictionary_count,dictionary_handling,cost_dram,cost_cxl\n";
++  }
++  std::cout << "- [EDBT-TRACE] ON run_id=" << _trace_run_id << " config=" << _trace_config
++            << " rep=" << _trace_rep << " decision_trace=" << _decision_trace_path << "\n";
++}
++
++std::string SemanticPlacementPlugin::trace_phase_label() const {
++  const auto start = Hyrise::get().timed_phase_start_steady_ns.load(std::memory_order_relaxed);
++  if (start < 0) return "warmup";
++  const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                       std::chrono::steady_clock::now().time_since_epoch())
++                       .count();
++  const auto planned = Hyrise::get().timed_phase_planned_duration_ns.load(std::memory_order_relaxed);
++  return static_cast<uint64_t>(now - start) < planned / 2 ? "timed_first_half" : "timed_second_half";
++}
++
+ // ─────────────────────────────────────────────────────────────────────────────
+ // P0-1/P0-2 (plan v2 §4): append one daemon_metrics.csv row for this cycle
+ // ─────────────────────────────────────────────────────────────────────────────
+diff --git a/src/plugins/semantic_placement_plugin.hpp b/src/plugins/semantic_placement_plugin.hpp
+index c5e4afe7d..b18b4b7eb 100644
+--- a/src/plugins/semantic_placement_plugin.hpp
++++ b/src/plugins/semantic_placement_plugin.hpp
+@@ -183,6 +183,29 @@ class SemanticPlacementPlugin : public AbstractPlugin {
+   uint64_t _init_bytes_migrated = 0;         // bytes moved in initial placement
+   size_t _init_copy_count = 0;               // number of initial placement copies
+ 
++  // ── EDBT v4 Phase B (commit B1): observation-only trace, default OFF ───────
++  // With options.placement_trace == false every member below is inert. When
++  // on, the daemon appends one row per considered segment per cycle to
++  // _decision_trace_path (schemas/decision_trace.schema.json) and the
++  // pre_benchmark_hook writes the plan_reference_only operator/segment
++  // reference trace once (no per-execution attribution under clients=10).
++  bool _trace_on = false;
++  std::string _trace_run_id;                 // EDBT_V4_RUN_ID env or JSON stem
++  std::string _trace_config;                 // our_full | our_freq (B3 adds cost_c3_greedy)
++  uint32_t _trace_rep = 1;                   // EDBT_V4_REP env or 1
++  std::string _decision_trace_path;
++  std::string _operator_trace_path;
++  // κ-corrected plan cardinality per segment (decisions vector; 0 = no plan
++  // reference, e.g. ablate_d1 arm or never-referenced segment)
++  std::unordered_map<SegmentKey, float, SegmentKeyHash> _trace_cardinality;
++
++  // Set up trace paths/run identity, write CSV headers; called from the
++  // pre_benchmark_hook when _trace_on. Also emits the [EDBT-TRACE] log line.
++  void init_trace(const std::string& json_path);
++
++  // warmup | timed_first_half | timed_second_half (from the runner's anchors)
++  std::string trace_phase_label() const;
++
+   // Metrics for post_benchmark_hook JSON report
+   size_t _total_decisions = 0;
+   size_t _local_count = 0;
+-- 
+2.34.1
+

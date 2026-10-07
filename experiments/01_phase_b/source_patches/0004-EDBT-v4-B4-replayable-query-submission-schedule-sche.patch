@@ -1,0 +1,221 @@
+From fab61b2fee237323833be3fa333054ce669fbff5 Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Mon, 14 Sep 2026 01:15:13 +0800
+Subject: [PATCH 4/4] EDBT v4 B4: replayable query-submission schedule
+ (--schedule_seed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An explicit query set does NOT fix Shuffled submission order — the
+permutation stream comes from std::random_device. --schedule_seed <n>
+(Shuffled mode only, enforced) replaces it with a seeded mt19937. Because
+the dispatch loop is single-threaded and counter-driven, submission i
+maps to perm_{floor(i/n)}[i mod n] regardless of how the concurrent
+clients interleave: same seed + same item set replays the same schedule
+(up to the run's own length; completion ORDER stays free and is visible
+in the per-item results JSON).
+
+When set, the runner writes next to the JSON output:
+- <json>_schedule_plan.csv: header (seed,item_count,plan_length=100000)
+  + pre-simulated plan from a private generator advancing in lockstep
+  (initial shuffle + one shuffle per wrap; E4 phase switching not
+  simulated — Phase B never enables it, warning printed if combined);
+- <json>_schedule_manifest.csv: actual submissions
+  (submission_index,item_id,item_name,scheduled_unix_ns).
+schedule_seed is also recorded in the benchmark context JSON.
+
+Verification (12s JOB runs, 10 clients, no plugin): seed=101 twice ->
+plans byte-identical, manifests 553/553 rows prefix-identical and exact
+prefixes of the plan; seed=202 diverges from submission 0.
+---
+ src/benchmarklib/benchmark_config.hpp  | 14 ++++++
+ src/benchmarklib/benchmark_runner.cpp  | 69 ++++++++++++++++++++++++--
+ src/benchmarklib/benchmark_runner.hpp  |  5 ++
+ src/benchmarklib/cli_config_parser.cpp | 16 ++++--
+ 4 files changed, 98 insertions(+), 6 deletions(-)
+
+diff --git a/src/benchmarklib/benchmark_config.hpp b/src/benchmarklib/benchmark_config.hpp
+index 2273588bb..8d7a6daf4 100644
+--- a/src/benchmarklib/benchmark_config.hpp
++++ b/src/benchmarklib/benchmark_config.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -68,6 +69,19 @@ class BenchmarkConfig {
+   Duration phase1_duration{0};
+   std::vector<size_t> phase1_item_ids{};
+   std::vector<size_t> phase2_item_ids{};
++
++  // ── EDBT v4 Phase B (commit B4): replayable query-submission schedule ──────
++  // Shuffled mode only. When set (non-zero), the item-permutation generator is
++  // seeded with this value instead of std::random_device, making the
++  // submission stream deterministic: the dispatch loop is single-threaded and
++  // counter-driven, so submission i maps to perm_{floor(i/n)}[i mod n] no
++  // matter how the concurrent clients interleave. The runner writes
++  //   <json>_schedule_plan.csv      pre-simulated first N submissions, and
++  //   <json>_schedule_manifest.csv  the actual submissions (index/item/time).
++  // Same seed + same item set ⇒ byte-identical plan and a manifest that is a
++  // prefix-identical replay; a different seed ⇒ different schedule. An
++  // explicit query set alone does NOT fix Shuffled order — this does.
++  std::optional<uint64_t> schedule_seed{};
+ };
+ 
+ }  // namespace hyrise
+diff --git a/src/benchmarklib/benchmark_runner.cpp b/src/benchmarklib/benchmark_runner.cpp
+index d630e5752..90c509b0e 100644
+--- a/src/benchmarklib/benchmark_runner.cpp
++++ b/src/benchmarklib/benchmark_runner.cpp
+@@ -308,12 +308,59 @@ void BenchmarkRunner::_benchmark_shuffled() {
+   }
+ 
+   // For shuffling the item order.
+-  auto random_device = std::random_device{};
+-  auto random_generator = std::mt19937{random_device()};
++  // EDBT v4 Phase B (commit B4): with --schedule_seed the generator is seeded
++  // deterministically (same seed ⇒ same permutation stream), which — because
++  // the dispatch loop below is single-threaded and counter-driven — fixes the
++  // submission stream: submission i = perm_{floor(i/n)}[i mod n] regardless of
++  // client interleaving. The pre-simulated plan and the actual manifest are
++  // written next to the JSON output for replay verification.
++  const auto pre_shuffle_item_ids = item_ids;
++  auto random_generator = std::mt19937{};
++  if (_config.schedule_seed) {
++    random_generator = std::mt19937{*_config.schedule_seed};
++  } else {
++    random_generator = std::mt19937{std::random_device{}()};
++  }
+ 
+   std::shuffle(item_ids.begin(), item_ids.end(), random_generator);
+   auto item_id_counter = size_t{0};
+ 
++  // [B4] Pre-simulate the deterministic submission plan on a private generator
++  // seeded identically (it advances in lockstep with the runtime generator:
++  // one initial shuffle, then one shuffle per wrap; E4 phase switching is not
++  // simulated — Phase B never enables it).
++  auto schedule_manifest = std::ofstream{};
++  if (_config.schedule_seed) {
++    constexpr auto kPlanLength = size_t{100'000};
++    auto plan_generator = std::mt19937{*_config.schedule_seed};
++    auto plan_pool = pre_shuffle_item_ids;
++    std::shuffle(plan_pool.begin(), plan_pool.end(), plan_generator);
++    if (phase_switch_enabled) {
++      std::cout << "- [EDBT v4 B4] WARNING: E4 phase switching active — schedule plan covers the phase-1 pool only\n";
++    }
++    if (_config.output_file_path) {
++      const auto& json_path = *_config.output_file_path;
++      const auto stem = json_path.substr(0, json_path.size() - std::string{".json"}.size());
++      const auto plan_path = stem + "_schedule_plan.csv";
++      auto plan = std::ofstream{plan_path};
++      plan << "seed,item_count,plan_length\n" << *_config.schedule_seed << "," << benchmark_item_count << ","
++           << kPlanLength << "\n";
++      plan << "submission_index,item_id,item_name\n";
++      for (auto i = size_t{0}; i < kPlanLength; ++i) {
++        const auto in_block = i % benchmark_item_count;
++        if (in_block == 0 && i != 0) {
++          std::shuffle(plan_pool.begin(), plan_pool.end(), plan_generator);
++        }
++        plan << i << "," << plan_pool[in_block] << ","
++             << _benchmark_item_runner->item_name(plan_pool[in_block]) << "\n";
++      }
++      std::cout << "- [EDBT v4 B4] schedule plan written: " << plan_path << " (" << kPlanLength
++                << " submissions, seed=" << *_config.schedule_seed << ")\n";
++      schedule_manifest.open(stem + "_schedule_manifest.csv");
++      schedule_manifest << "submission_index,item_id,item_name,scheduled_unix_ns\n";
++    }
++  }
++
+   Assert(_currently_running_clients == 0, "Did not expect any clients to run at this time.");
+ 
+   _state = BenchmarkState{_config.max_duration};
+@@ -361,6 +408,19 @@ void BenchmarkRunner::_benchmark_shuffled() {
+     }
+ 
+     const auto item_id = item_ids[item_id_counter];
++    // [B4] actual submission record (deterministic order; scheduled_unix_ns is
++    // the only run-dependent field — client completion order stays free and is
++    // visible in the per-item results JSON).
++    if (schedule_manifest.is_open()) {
++      auto ts = timespec{};
++      clock_gettime(CLOCK_REALTIME, &ts);
++      schedule_manifest << _total_scheduled_runs << "," << item_id << ","
++                        << _benchmark_item_runner->item_name(item_id) << ","
++                        << static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
++                               static_cast<uint64_t>(ts.tv_nsec)
++                        << "\n";
++    }
++    ++_total_scheduled_runs;
+     _schedule_item_run(item_id);
+     ++item_id_counter;
+   }
+@@ -665,7 +725,8 @@ cxxopts::Options BenchmarkRunner::get_basic_cli_options(const std::string& bench
+     ("system_metrics", "Track system metrics (system utilization, segment accesses, etc.) and add them to the output JSON (see -o).", cxxopts::value<bool>()->default_value("false"))  // NOLINT(whitespace/line_length)
+     ("pipeline_metrics", "Track SQL pipeline metrics (runtime of steps in SQL pipeline, optimizer rule durations) and add them to the output JSON (see -o). Tracking pipeline metrics switches off plan caching.", cxxopts::value<bool>()->default_value("false"))  // NOLINT(whitespace/line_length)
+     // This option is only advised when the underlying system's memory capacity is overleaded by the preparation phase.
+-    ("data_preparation_cores", "Specify the number of cores used by the scheduler for data preparation, i.e., sorting and encoding tables and generating table statistics. 0 means all available cores.", cxxopts::value<uint32_t>()->default_value("0"));  // NOLINT(whitespace/line_length)
++    ("data_preparation_cores", "Specify the number of cores used by the scheduler for data preparation, i.e., sorting and encoding tables and generating table statistics. 0 means all available cores.", cxxopts::value<uint32_t>()->default_value("0"))  // NOLINT(whitespace/line_length)
++    ("schedule_seed", "[EDBT v4 B4] Seed the Shuffled submission-order generator (0 = std::random_device); writes <json>_schedule_plan.csv + <json>_schedule_manifest.csv for replay", cxxopts::value<uint64_t>()->default_value("0"));  // NOLINT(whitespace/line_length)
+   // clang-format on
+ 
+   return cli_options;
+@@ -702,6 +763,8 @@ nlohmann::json BenchmarkRunner::create_context(const BenchmarkConfig& config) {
+                         {"using_scheduler", config.enable_scheduler},
+                         {"cores", config.cores},
+                         {"clients", config.clients},
++                        {"schedule_seed", config.schedule_seed ? nlohmann::json{*config.schedule_seed}
++                                                               : nlohmann::json{nullptr}},
+                         {"data_preparation_cores", config.data_preparation_cores},
+                         {"verify", config.verify},
+                         {"time_unit", "ns"},
+diff --git a/src/benchmarklib/benchmark_runner.hpp b/src/benchmarklib/benchmark_runner.hpp
+index 5c6c114f5..50911894f 100644
+--- a/src/benchmarklib/benchmark_runner.hpp
++++ b/src/benchmarklib/benchmark_runner.hpp
+@@ -117,6 +117,11 @@ class BenchmarkRunner : public Noncopyable {
+   // were unsuccessful (e.g., because of transaction aborts).
+   std::atomic_uint32_t _total_finished_runs{0};
+ 
++  // EDBT v4 Phase B (commit B4): submission counter for the schedule manifest
++  // (scheduled items, single-threaded dispatch; distinct from
++  // _total_finished_runs, which counts completions from all client threads).
++  size_t _total_scheduled_runs{0};
++
+   BenchmarkState _state{Duration{0}};
+ 
+   int _snapshot_id{0};
+diff --git a/src/benchmarklib/cli_config_parser.cpp b/src/benchmarklib/cli_config_parser.cpp
+index c10680e62..1b8bd731a 100644
+--- a/src/benchmarklib/cli_config_parser.cpp
++++ b/src/benchmarklib/cli_config_parser.cpp
+@@ -175,10 +175,20 @@ std::shared_ptr<BenchmarkConfig> CLIConfigParser::parse_cli_options(const cxxopt
+     boost::split(plugins, comma_separated_plugins, boost::is_any_of(","), boost::token_compress_on);
+   }
+ 
+-  return std::make_shared<BenchmarkConfig>(
++  auto config = std::make_shared<BenchmarkConfig>(
+       benchmark_mode, chunk_size, *encoding_config, chunk_indexes, table_indexes, max_runs, timeout_duration,
+-      warmup_duration, output_file_path, enable_scheduler, cores, data_preparation_cores, clients, enable_visualization,
+-      verify, cache_binary_tables, system_metrics, pipeline_metrics, plugins);
++      warmup_duration, output_file_path, enable_scheduler, cores, data_preparation_cores, clients,
++      enable_visualization, verify, cache_binary_tables, system_metrics, pipeline_metrics, plugins);
++
++  // EDBT v4 Phase B (commit B4): deterministic, replayable submission schedule.
++  const auto schedule_seed = parse_result["schedule_seed"].as<uint64_t>();
++  if (schedule_seed != 0) {
++    Assert(benchmark_mode == BenchmarkMode::Shuffled,
++           "--schedule_seed only applies to Shuffled mode (Ordered mode has no shuffle).");
++    config->schedule_seed = schedule_seed;
++    std::cout << "- [EDBT v4 B4] Seeded query-submission schedule (seed=" << schedule_seed << ")\n";
++  }
++  return config;
+ }
+ 
+ EncodingConfig CLIConfigParser::parse_encoding_config(const std::string& encoding_file_str) {
+-- 
+2.34.1
+

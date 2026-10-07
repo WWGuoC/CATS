@@ -1,0 +1,5 @@
+memory_type,mode,access_size_bytes,avg_ns,min_ns,max_ns,median_ns,std_dev_ns,p50_ns,p90_ns,p99_ns,p999_ns,num_operations,ops_per_second,execution_time_s,sample_count,source_file
+DDR,random_latency,64,218.3,29,727,215,59.1,215,281,411,551,2105032704,109575027.0,19.21,9999,ddr_cxl_lat_test-2026-08-10-15-40-35.json
+CXL,random_latency,64,710.9,60,5177,749,184.8,749,810,999,1090,2105032704,30565626.0,68.87,9999,ddr_cxl_lat_test-2026-08-10-15-40-35.json
+DDR,sequential_latency,8,102.9,57,450,100,27.9,100,136,140,143,800000000,5500425289.0,0.15,9999,seq_lat_test-2026-08-10-15-43-43.json
+CXL,sequential_latency,8,84.5,31,951,67,62.1,67,136,409,558,800000000,3545990113.0,0.23,9999,seq_lat_test-2026-08-10-15-43-43.json

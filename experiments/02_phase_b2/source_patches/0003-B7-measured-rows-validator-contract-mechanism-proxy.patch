@@ -1,0 +1,367 @@
+From e1e02edf992137ee2279d1a3cd5d226547330f3d Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Tue, 15 Sep 2026 13:37:41 +0800
+Subject: [PATCH] EDBT v4 B7 (Phase B2): measured operator-trace rows only with
+ actual_reads; operator wall/rows sidecar; mechanism proxy builder
+
+The pack validator contract requires every attribution_level=measured_per_execution
+row in operator_segment_trace.csv to carry actual_reads. The B5 emission wrote such
+rows for ALL scans with actual_reads empty whenever the query referenced a
+(table,column) more than once (unique-scan rule) -> the measured smoke bundle failed
+validation (25-error cap; the whole non-unique row class).
+
+Fix: operator_segment_trace.csv now receives measured rows ONLY for unique scans
+(attribution always reliable); every scan's measured wall_ns/rows_in/rows_out move
+to a new attribution-free sidecar benchmark_operator_wall_rows.csv (unique_scan
+column documents the rule). measured_segment_access.csv (per-segment deltas, all
+segments) is unchanged.
+
+Also versions experiments/edbt_v4/build_mechanism_proxy.py (B2-4 downstream half:
+per-cycle counter deltas + tiered logical access proxy).
+---
+ experiments/edbt_v4/build_mechanism_proxy.py | 217 +++++++++++++++++++
+ src/plugins/semantic_placement_plugin.cpp    |  50 ++++-
+ src/plugins/semantic_placement_plugin.hpp    |  11 +-
+ 3 files changed, 264 insertions(+), 14 deletions(-)
+ create mode 100644 experiments/edbt_v4/build_mechanism_proxy.py
+
+diff --git a/experiments/edbt_v4/build_mechanism_proxy.py b/experiments/edbt_v4/build_mechanism_proxy.py
+new file mode 100644
+index 000000000..be08122cd
+--- /dev/null
++++ b/experiments/edbt_v4/build_mechanism_proxy.py
+@@ -0,0 +1,217 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 mechanism proxy builder (B2-4, downstream half).
++
++The B2-4 trace emits CUMULATIVE typed counters per (cycle, segment) for every
++policy. This script turns them into:
++
++  1. per_cycle_segment_deltas.csv.gz — the per-cycle delta per segment
++     (counter[j] - counter[i] for consecutive snapshots i -> j of the same
++     segment, clamped at 0), annotated with the tier IN EFFECT during that
++     interval (the post-decision tier of snapshot i).
++  2. tiered_logical_access_proxy.csv — logical access events aggregated by
++     effective tier and access pattern.
++
++IMPORTANT SEMANTICS (B2-4 wording):
++  * These are LOGICAL ACCESS PROXY numbers derived from Hyrise per-segment
++    access counters. They are NOT physical CXL/DRAM traffic measurements —
++    no byte counts on the interconnect are claimed, pages may be prefetched,
++    counters count operator-level touches, and dictionary events are separate
++    dictionary-structure accesses.
++  * Interval attribution: the placement state during interval (i, j] is the
++    state AFTER cycle i's decisions, i.e. target_tier when the row records a
++    move, else source_tier ("UNCHANGED"/"keep" rows).
++  * Coverage: accesses before the FIRST daemon snapshot and after the LAST
++    snapshot are not attributable to any interval and are excluded — proxy
++    totals are strictly less than the final cumulative counters (documented
++    under-coverage, no inflation).
++
++Usage:
++  python3 build_mechanism_proxy.py \
++      --bundles smoke_b2_our_full_traceon smoke_b2_our_freq_traceon \
++                smoke_b2_cost_c3_greedy_traceon \
++      [--smoke-root results_edbt_v4/02_phase_b2/smoke_runs] \
++      [--outdir   results_edbt_v4/02_phase_b2/mechanism_proxy]
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import gzip
++import hashlib
++import json
++import shutil
++import subprocess
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++GAMMAS = ("sequential", "monotonic", "random", "point", "dictionary")
++COUNTER_COLS = ("sequential_count", "monotonic_count", "random_count",
++                "point_count", "dictionary_count")
++
++
++def sha256_file(p: Path) -> str:
++    return hashlib.sha256(p.read_bytes()).hexdigest()
++
++
++def git_hash() -> str:
++    return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
++                                   text=True).strip()
++
++
++def counts_of(row: dict) -> tuple[int, ...]:
++    out = []
++    for c in COUNTER_COLS:
++        v = (row.get(c) or "").strip()
++        out.append(int(v) if v else 0)
++    return tuple(out)
++
++
++def post_tier_of(row: dict) -> str:
++    # Tier in effect after this cycle's decision: a recorded move carries the
++    # new tier in target_tier; "UNCHANGED"/"keep" rows keep source_tier.
++    tgt = (row.get("target_tier") or "").strip()
++    if tgt in ("DRAM", "CXL"):
++        return tgt
++    return (row.get("source_tier") or "").strip() or "UNKNOWN"
++
++
++def process_bundle(bundle_dir: Path, outdir: Path) -> dict:
++    trace = bundle_dir / "decision_trace.csv"
++    if not trace.exists():
++        alt = bundle_dir / "benchmark_decision_trace.csv"
++        if not alt.exists():
++            raise FileNotFoundError(f"no decision trace in {bundle_dir}")
++        trace = alt
++    run_id = bundle_dir.name
++    cfg_name = json.loads((bundle_dir / "run_config.json").read_text()).get("config", run_id)
++
++    # Pass 1: collect per-segment snapshot sequences (cycle order as emitted).
++    per_seg: dict[tuple, list[dict]] = defaultdict(list)
++    n_rows = 0
++    with open(trace, newline="") as f:
++        for row in csv.DictReader(f):
++            n_rows += 1
++            key = (row["table_name"], int(row["chunk_id"]), int(row["column_id"]))
++            per_seg[key].append(row)
++
++    # Pass 2: consecutive-snapshot deltas.
++    deltas_path = outdir / f"per_cycle_segment_deltas_{run_id}.csv.gz"
++    agg: dict[tuple[str, str], int] = defaultdict(int)  # (tier, gamma) -> events
++    n_delta_rows = 0
++    covered_total = 0
++    final_cumulative = [0] * len(GAMMAS)
++    with gzip.open(deltas_path, "wt", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["run_id", "config", "table_name", "chunk_id", "column_id",
++                    "cycle_from", "cycle_to", "phase", "tier_effective",
++                    "delta_sequential", "delta_monotonic", "delta_random",
++                    "delta_point", "delta_dictionary", "delta_total",
++                    "attribution_level"])
++        for key, rows in per_seg.items():
++            rows.sort(key=lambda r: int(r["cycle_id"]))  # safety; emitted in order
++            final = counts_of(rows[-1])
++            final_cumulative = [a + b for a, b in zip(final_cumulative, final)]
++            for i, j in zip(rows, rows[1:]):
++                ci, cj = counts_of(i), counts_of(j)
++                d = tuple(max(0, b - a) for a, b in zip(ci, cj))
++                tier = post_tier_of(i)
++                total = sum(d)
++                w.writerow([run_id, cfg_name, key[0], key[1], key[2],
++                            i["cycle_id"], j["cycle_id"], i.get("phase", ""),
++                            tier, *d, total, "interval_logical_proxy"])
++                n_delta_rows += 1
++                covered_total += total
++                for g, v in zip(GAMMAS, d):
++                    agg[(tier, g)] += v
++            # the last snapshot of each segment has no successor interval —
++            # its (yet unobserved) events simply never enter the proxy
++
++    return {
++        "bundle": run_id, "config": cfg_name, "trace_rows": n_rows,
++        "segments": len(per_seg), "delta_rows": n_delta_rows,
++        "deltas_gz": deltas_path.name, "deltas_gz_sha256": sha256_file(deltas_path),
++        "final_cumulative_total": sum(final_cumulative),
++        "covered_logical_events": covered_total,
++        "coverage_note": "events before first / after last snapshot excluded",
++        "aggregate": {f"{tier}|{gamma}": v for (tier, gamma), v in sorted(agg.items())},
++        "_agg": agg, "_final": final_cumulative,
++    }
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--bundles", nargs="+", required=True)
++    ap.add_argument("--smoke-root", default=str(ROOT / "results_edbt_v4/02_phase_b2/smoke_runs"))
++    ap.add_argument("--outdir", default=str(ROOT / "results_edbt_v4/02_phase_b2/mechanism_proxy"))
++    args = ap.parse_args()
++    smoke_root = Path(args.smoke_root)
++    outdir = Path(args.outdir)
++    outdir.mkdir(parents=True, exist_ok=True)
++
++    results = []
++    proxy_rows = []
++    for name in args.bundles:
++        print(f"[PROXY] {name}", flush=True)
++        r = process_bundle(smoke_root / name, outdir)
++        agg, final = r.pop("_agg"), r.pop("_final")
++        results.append(r)
++        for (tier, gamma), v in sorted(agg.items()):
++            proxy_rows.append([r["bundle"], r["config"], tier, gamma,
++                               v, "logical_access_events"])
++
++    with open(outdir / "tiered_logical_access_proxy.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["run_id", "config", "tier_effective", "access_pattern",
++                    "logical_access_events", "unit_note"])
++        w.writerows(proxy_rows)
++
++    report = {
++        "experiment": "EDBT_V4_PHASE_B2_MECHANISM_PROXY",
++        "git_head": git_hash(),
++        "script": str(Path(__file__).resolve()),
++        "script_sha256": sha256_file(Path(__file__).resolve()),
++        "semantics": [
++            "LOGICAL ACCESS PROXY from Hyrise per-segment typed access counters;",
++            "NOT physical CXL/DRAM interconnect traffic (no bytes claimed)",
++            "interval (i,j] attributed to the post-decision tier of snapshot i",
++            "pre-first-snapshot and post-last-snapshot events excluded (documented",
++            "under-coverage: proxy totals < final cumulative counters)",
++        ],
++        "bundles": results,
++    }
++    (outdir / "mechanism_proxy_report.json").write_text(json.dumps(report, indent=2) + "\n")
++    shutil.copy2(Path(__file__).resolve(), outdir / "build_mechanism_proxy.py.snapshot")
++
++    # Human-readable summary
++    lines = ["# B2-4 mechanism proxy — tiered logical access events", "",
++             "> Logical access proxy from per-segment typed counters. NOT physical",
++             "> CXL/DRAM traffic. Interval attribution: tier in effect after cycle i",
++             "> governs events counted between snapshots i and j.", ""]
++    for r in results:
++        lines.append(f"## {r['bundle']} ({r['config']})")
++        lines.append(f"- trace rows {r['trace_rows']}, segments {r['segments']}, "
++                     f"delta rows {r['delta_rows']}")
++        lines.append(f"- covered logical events {r['covered_logical_events']} of final "
++                     f"cumulative {r['final_cumulative_total']} "
++                     f"({100.0 * r['covered_logical_events'] / max(1, r['final_cumulative_total']):.1f}%)")
++        tiers = defaultdict(dict)
++        for k, v in r["aggregate"].items():
++            t, g = k.split("|")
++            tiers[t][g] = v
++        for t in sorted(tiers):
++            tot = sum(tiers[t].values())
++            lines.append(f"- tier {t}: {tot} events — " +
++                         ", ".join(f"{g}={tiers[t][g]}" for g in GAMMAS if g in tiers[t]))
++        lines.append("")
++    (outdir / "README.md").write_text("\n".join(lines) + "\n")
++    print(json.dumps({k: v for k, v in report.items() if k != "bundles"}, indent=2))
++    for r in results:
++        print(f"  {r['bundle']}: {r['delta_rows']} delta rows, "
++              f"{r['covered_logical_events']} covered events")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/plugins/semantic_placement_plugin.cpp b/src/plugins/semantic_placement_plugin.cpp
+index 17ae53cd2..7b2ae69e0 100644
+--- a/src/plugins/semantic_placement_plugin.cpp
++++ b/src/plugins/semantic_placement_plugin.cpp
+@@ -1187,6 +1187,19 @@ void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
+                   "sequential_delta,monotonic_delta,random_delta,point_delta,dictionary_delta,"
+                   "total_delta,tier_at_execution,attribution_level\n";
+   auto operator_ofs = std::ofstream(_operator_trace_path, std::ios::app);
++  // Per-operator wall/rows diagnostics (B2-5): written for EVERY TableScan of
++  // every executed query. Operator-level duration/row metrics are reliable per
++  // execution, but they carry NO segment-read attribution — the operator
++  // segment trace only accepts rows whose actual_reads is filled (validator
++  // contract: attribution_level=measured_per_execution requires actual_reads),
++  // so this sidecar keeps the complete operator duration/rows record without
++  // any attribution claim.
++  const auto wall_rows_path = _decision_trace_path.substr(0, _decision_trace_path.size() -
++                                                                        std::string("_decision_trace.csv").size()) +
++                               "_operator_wall_rows.csv";
++  std::ofstream wall_ofs(wall_rows_path);
++  wall_ofs << "run_id,config,rep,query_name,execution_id,operator_index,operator_name,"
++              "table_name,column_id,rows_in,rows_out,wall_ns,unique_scan,n_chunks_touched\n";
+ 
+   // Snapshot every segment's five pattern counters (cumulative values).
+   const auto snapshot_counters = [&]() {
+@@ -1235,6 +1248,7 @@ void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
+ 
+   auto measured_rows = size_t{0};
+   auto operator_rows = size_t{0};
++  auto wall_rows = size_t{0};
+   for (const auto& sql_file : sql_files) {
+     auto ifstream = std::ifstream(sql_file);
+     if (!ifstream.is_open()) continue;
+@@ -1295,9 +1309,11 @@ void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
+     }
+ 
+     // Operator rows: one per TableScan over a stored table (the memory-touching
+-    // operator class). Collect scans per (table, column); actual_reads is the
+-    // measured segment delta ONLY when exactly one scan of this query
+-    // references that (table, column) — otherwise null.
++    // operator class). Collect scans per (table, column); a scan's actual_reads
++    // (measured segment delta) is attributable ONLY when exactly one scan of
++    // this query references that (table, column). Operator-trace rows exist
++    // only for those unique scans (validator contract: measured rows require
++    // actual_reads); every scan's wall/rows goes to the wall-rows sidecar.
+     struct ScanRef {
+       std::shared_ptr<AbstractOperator> scan;
+       std::shared_ptr<AbstractOperator> input;   // operator directly beneath (rows_in)
+@@ -1354,16 +1370,26 @@ void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
+       const auto pruned = std::set<ChunkID>(ref.pruned_chunks.begin(), ref.pruned_chunks.end());
+       if (!storage_manager.has_table(ref.table_name)) continue;
+       const auto chunk_count = storage_manager.get_table(ref.table_name)->chunk_count();
++      auto chunks_touched = size_t{0};
++      for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
++        if (!pruned.count(chunk_id)) ++chunks_touched;
++      }
++      // Every scan's measured duration/rows — no attribution claimed.
++      wall_ofs << _trace_run_id << "," << _trace_config << "," << _trace_rep << "," << query_name
++               << ",0," << i << ",TableScan," << ref.table_name << "," << column_id << ","
++               << rows_in << "," << rows_out << "," << wall_ns << ","
++               << (unique ? "true" : "false") << "," << chunks_touched << "\n";
++      ++wall_rows;
++      if (!unique) continue;  // non-unique scans: no measured operator-trace rows
+       for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
+         if (pruned.count(chunk_id)) continue;
+         const SegmentKey key{ref.table_name, chunk_id, column_id};
+-        // unique-scan rule: measured delta attributed to this scan only when
+-        // this query has exactly one scan on (table, column); else null.
+-        auto actual_reads = std::string{};
+-        if (unique) {
+-          const auto it = deltas.find(key);
+-          if (it != deltas.end()) actual_reads = std::to_string(it->second.total);
+-        }
++        // unique-scan rule: the measured delta of this (table, column) is
++        // attributable to this scan. A missing delta entry is a measured ZERO
++        // (the deltas map only stores total > 0), never an unknown — write 0.
++        auto actual_reads = std::string{"0"};
++        const auto it = deltas.find(key);
++        if (it != deltas.end()) actual_reads = std::to_string(it->second.total);
+         operator_ofs << _trace_run_id << "," << _trace_config << "," << _trace_rep << "," << query_name
+                      << ",0," << i << ",TableScan," << ref.table_name << "," << chunk_id << ","
+                      << column_id << ",0," << rows_in << "," << rows_out << "," << wall_ns << ","
+@@ -1375,7 +1401,9 @@ void SemanticPlacementPlugin::run_measured_diagnostic_pass() {
+ 
+   std::cout << "- [EDBT-MEASURED] diagnostic pass: " << measured_rows
+             << " measured segment-delta rows, " << operator_rows
+-            << " measured operator rows -> " << _measured_segment_access_path << "\n";
++            << " measured operator rows (unique-scan only), " << wall_rows
++            << " operator wall/rows rows -> " << _measured_segment_access_path << " / "
++            << wall_rows_path << "\n";
+ 
+   // Re-sync the daemon's baseline snapshots: the measured queries themselves
+   // bumped the cumulative counters, and daemon cycle 1's deltas must cover
+diff --git a/src/plugins/semantic_placement_plugin.hpp b/src/plugins/semantic_placement_plugin.hpp
+index 106f8868a..c6ef3dc90 100644
+--- a/src/plugins/semantic_placement_plugin.hpp
++++ b/src/plugins/semantic_placement_plugin.hpp
+@@ -232,9 +232,14 @@ class SemanticPlacementPlugin : public AbstractPlugin {
+   //       (attribution_level=measured_per_execution; exact because sequential)
+   //   appended measured_per_execution rows in <json>_operator_segment_trace.csv
+   //       per PQP TableScan over a stored table: rows/wall from the executed
+-  //       PQP performance data; actual_reads filled ONLY when exactly one scan
+-  //       of that query references the segment's (table, column) — otherwise
+-  //       null (operator association is never fabricated).
++  //       PQP performance data. Emitted ONLY when exactly one scan of that
++  //       query references the segment's (table, column) — the pack validator
++  //       contract requires actual_reads on every measured row, and reads are
++  //       attributable to one scan only under that uniqueness rule (operator
++  //       association is never fabricated).
++  //   <json>_operator_wall_rows.csv — per-scan duration/rows for EVERY scan
++  //       (attribution-free diagnostic: wall_ns/rows_in/rows_out are reliable
++  //       per execution; unique_scan column documents the rule above).
+   bool _trace_measured = false;
+   std::string _measured_segment_access_path;
+   void run_measured_diagnostic_pass();
+-- 
+2.34.1
+

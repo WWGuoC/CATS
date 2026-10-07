@@ -1,0 +1,278 @@
+{
+  "seed": 20270910,
+  "validated_runs": 50,
+  "comparisons": [
+    {
+      "comparison": "our_full_vs_our_freq",
+      "metric": "paired_geometric_mean_latency_ratio",
+      "interpretation": "negative effect_pct means the first configuration is faster",
+      "n_pairs": 10,
+      "paired_blocks": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "all_available_schedule_hashes_match": true,
+      "effect_pct": -10.979965343897701,
+      "bootstrap_95_ci_pct": [
+        -11.362942786501174,
+        -10.557839065763897
+      ],
+      "randomization_p_value_two_sided": 0.001953125,
+      "p_value_method": "exact_sign_flip_1024",
+      "raw_pairs_ms": [
+        {
+          "our_full": 87.712913,
+          "our_freq": 99.348066
+        },
+        {
+          "our_full": 87.57975,
+          "our_freq": 98.156728
+        },
+        {
+          "our_full": 88.274094,
+          "our_freq": 98.795928
+        },
+        {
+          "our_full": 88.780074,
+          "our_freq": 98.1537
+        },
+        {
+          "our_full": 88.223508,
+          "our_freq": 99.226936
+        },
+        {
+          "our_full": 88.393273,
+          "our_freq": 99.104487
+        },
+        {
+          "our_full": 88.033877,
+          "our_freq": 99.674762
+        },
+        {
+          "our_full": 88.16064,
+          "our_freq": 98.864906
+        },
+        {
+          "our_full": 88.170798,
+          "our_freq": 98.829484
+        },
+        {
+          "our_full": 87.769546,
+          "our_freq": 99.626102
+        }
+      ]
+    },
+    {
+      "comparison": "our_full_vs_cost_c3_greedy",
+      "metric": "paired_geometric_mean_latency_ratio",
+      "interpretation": "negative effect_pct means the first configuration is faster",
+      "n_pairs": 10,
+      "paired_blocks": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "all_available_schedule_hashes_match": true,
+      "effect_pct": -10.247882114454931,
+      "bootstrap_95_ci_pct": [
+        -10.728281764375891,
+        -9.719411414631107
+      ],
+      "randomization_p_value_two_sided": 0.001953125,
+      "p_value_method": "exact_sign_flip_1024",
+      "raw_pairs_ms": [
+        {
+          "our_full": 87.712913,
+          "cost_c3_greedy": 98.844963
+        },
+        {
+          "our_full": 87.57975,
+          "cost_c3_greedy": 96.87237
+        },
+        {
+          "our_full": 88.274094,
+          "cost_c3_greedy": 98.95599
+        },
+        {
+          "our_full": 88.780074,
+          "cost_c3_greedy": 97.004127
+        },
+        {
+          "our_full": 88.223508,
+          "cost_c3_greedy": 98.616236
+        },
+        {
+          "our_full": 88.393273,
+          "cost_c3_greedy": 97.44292
+        },
+        {
+          "our_full": 88.033877,
+          "cost_c3_greedy": 98.773391
+        },
+        {
+          "our_full": 88.16064,
+          "cost_c3_greedy": 98.084755
+        },
+        {
+          "our_full": 88.170798,
+          "cost_c3_greedy": 98.77191
+        },
+        {
+          "our_full": 87.769546,
+          "cost_c3_greedy": 98.356999
+        }
+      ]
+    },
+    {
+      "comparison": "our_full_vs_dram_only",
+      "metric": "paired_geometric_mean_latency_ratio",
+      "interpretation": "negative effect_pct means the first configuration is faster",
+      "n_pairs": 10,
+      "paired_blocks": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "all_available_schedule_hashes_match": true,
+      "effect_pct": -9.020198062283447,
+      "bootstrap_95_ci_pct": [
+        -9.375101034507004,
+        -8.652862578055831
+      ],
+      "randomization_p_value_two_sided": 0.001953125,
+      "p_value_method": "exact_sign_flip_1024",
+      "raw_pairs_ms": [
+        {
+          "our_full": 87.712913,
+          "dram_only": 96.968638
+        },
+        {
+          "our_full": 87.57975,
+          "dram_only": 97.04249
+        },
+        {
+          "our_full": 88.274094,
+          "dram_only": 96.419214
+        },
+        {
+          "our_full": 88.780074,
+          "dram_only": 96.403015
+        },
+        {
+          "our_full": 88.223508,
+          "dram_only": 97.835697
+        },
+        {
+          "our_full": 88.393273,
+          "dram_only": 96.956078
+        },
+        {
+          "our_full": 88.033877,
+          "dram_only": 96.821081
+        },
+        {
+          "our_full": 88.16064,
+          "dram_only": 96.790451
+        },
+        {
+          "our_full": 88.170798,
+          "dram_only": 96.448402
+        },
+        {
+          "our_full": 87.769546,
+          "dram_only": 96.771076
+        }
+      ]
+    },
+    {
+      "comparison": "our_full_vs_cxl_only",
+      "metric": "paired_geometric_mean_latency_ratio",
+      "interpretation": "negative effect_pct means the first configuration is faster",
+      "n_pairs": 10,
+      "paired_blocks": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "all_available_schedule_hashes_match": true,
+      "effect_pct": -23.370359382940375,
+      "bootstrap_95_ci_pct": [
+        -23.645131675287356,
+        -23.09669204152168
+      ],
+      "randomization_p_value_two_sided": 0.001953125,
+      "p_value_method": "exact_sign_flip_1024",
+      "raw_pairs_ms": [
+        {
+          "our_full": 87.712913,
+          "cxl_only": 114.642066
+        },
+        {
+          "our_full": 87.57975,
+          "cxl_only": 114.428052
+        },
+        {
+          "our_full": 88.274094,
+          "cxl_only": 114.169403
+        },
+        {
+          "our_full": 88.780074,
+          "cxl_only": 115.044296
+        },
+        {
+          "our_full": 88.223508,
+          "cxl_only": 115.247114
+        },
+        {
+          "our_full": 88.393273,
+          "cxl_only": 115.124635
+        },
+        {
+          "our_full": 88.033877,
+          "cxl_only": 114.449567
+        },
+        {
+          "our_full": 88.16064,
+          "cxl_only": 114.94031
+        },
+        {
+          "our_full": 88.170798,
+          "cxl_only": 116.156441
+        },
+        {
+          "our_full": 87.769546,
+          "cxl_only": 115.617979
+        }
+      ]
+    }
+  ]
+}

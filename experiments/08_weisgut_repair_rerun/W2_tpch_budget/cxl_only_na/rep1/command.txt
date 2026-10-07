@@ -1,0 +1,1 @@
+numactl -N 1 -m 2 /home/dameng/CXL_migration/hyrise/build/hyriseBenchmarkTPCH --scale 100 -m Shuffled --scheduler --cores 0 --clients 10 --time 1200 --warmup 10 --schedule_seed 4001 -o /home/dameng/CXL_migration/hyrise/results_edbt_v4/08_weisgut_repair_rerun/W2_tpch_budget/cxl_only_na/rep1/benchmark.json

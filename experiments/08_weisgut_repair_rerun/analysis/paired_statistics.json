@@ -1,0 +1,209 @@
+{
+  "generated": "2026-10-03T10:39:28Z",
+  "comparisons": [
+    {
+      "comparison": "W2[c05] our_full vs weisgut_static_column",
+      "metric": "relative_latency_pct (100*(L_our_full/L_static-1); negative = our_full faster)",
+      "n_pairs": 3,
+      "raw_pairs_ms": {
+        "1": [
+          5750.853154,
+          5525.257841
+        ],
+        "2": [
+          5718.292879,
+          5461.961846
+        ],
+        "3": [
+          5678.612846,
+          5485.583587
+        ]
+      },
+      "effect_pct": 4.097179319481525,
+      "bootstrap_95_ci_pct": [
+        3.51884637137696,
+        4.693021303100475
+      ],
+      "p_value_two_sided": 0.25,
+      "p_method": "exact_sign_flip_8"
+    },
+    {
+      "comparison": "W2[c10] our_full vs weisgut_static_column",
+      "metric": "relative_latency_pct (100*(L_our_full/L_static-1); negative = our_full faster)",
+      "n_pairs": 3,
+      "raw_pairs_ms": {
+        "1": [
+          5361.91011,
+          5197.908899
+        ],
+        "2": [
+          5468.072452,
+          5249.280972
+        ],
+        "3": [
+          5533.499532,
+          5313.358588
+        ]
+      },
+      "effect_pct": 3.8210346098257686,
+      "bootstrap_95_ci_pct": [
+        3.1551382332143385,
+        4.168027605438707
+      ],
+      "p_value_two_sided": 0.25,
+      "p_method": "exact_sign_flip_8"
+    },
+    {
+      "comparison": "W2[c20] our_full vs weisgut_static_column",
+      "metric": "relative_latency_pct (100*(L_our_full/L_static-1); negative = our_full faster)",
+      "n_pairs": 3,
+      "raw_pairs_ms": {
+        "1": [
+          5058.063583,
+          4961.194188
+        ],
+        "2": [
+          5036.066482,
+          5054.300428
+        ],
+        "3": [
+          5052.431858,
+          5088.633485
+        ]
+      },
+      "effect_pct": 0.28652535300102144,
+      "bootstrap_95_ci_pct": [
+        -0.7114213886048937,
+        1.952541894737858
+      ],
+      "p_value_two_sided": 1.0,
+      "p_method": "exact_sign_flip_8"
+    },
+    {
+      "comparison": "W2[c05] our_full recovery",
+      "recovery_pct": 77.70123913771587,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5715.919626333333
+    },
+    {
+      "comparison": "W2[c05] weisgut_static_column recovery",
+      "recovery_pct": 82.56708864493682,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5490.934424666667
+    },
+    {
+      "comparison": "W2[c10] our_full recovery",
+      "recovery_pct": 83.35520034575279,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5454.494031333334
+    },
+    {
+      "comparison": "W2[c10] weisgut_static_column recovery",
+      "recovery_pct": 87.70183338208663,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5253.516153
+    },
+    {
+      "comparison": "W2[c20] our_full recovery",
+      "recovery_pct": 92.12814833006887,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5048.853974333334
+    },
+    {
+      "comparison": "W2[c20] weisgut_static_column recovery",
+      "recovery_pct": 92.43405969718494,
+      "dram_ref_ms": 4684.878448,
+      "cxl_ref_ms": 9308.638417,
+      "method_ms": 5034.709367
+    },
+    {
+      "comparison": "W3[JOB] our_full vs weisgut_static_column",
+      "metric": "relative_latency_pct (100*(L_our_full/L_static-1); negative = our_full faster)",
+      "n_pairs": 10,
+      "raw_pairs_ms": {
+        "1": [
+          87.743385,
+          98.928217
+        ],
+        "2": [
+          88.295473,
+          98.484447
+        ],
+        "3": [
+          88.108765,
+          98.281958
+        ],
+        "4": [
+          87.872882,
+          99.336642
+        ],
+        "5": [
+          88.203648,
+          98.233093
+        ],
+        "6": [
+          87.534411,
+          98.720312
+        ],
+        "7": [
+          87.98981,
+          97.835958
+        ],
+        "8": [
+          87.412843,
+          98.939567
+        ],
+        "9": [
+          88.489602,
+          98.888653
+        ],
+        "10": [
+          88.195819,
+          97.868522
+        ]
+      },
+      "effect_pct": -10.721957608992073,
+      "bootstrap_95_ci_pct": [
+        -11.107855033235115,
+        -10.333225801553247
+      ],
+      "p_value_two_sided": 0.001953125,
+      "p_method": "exact_sign_flip_1024"
+    },
+    {
+      "comparison": "W3[JOB] our_full recovery",
+      "recovery_pct": 164.17395191268318,
+      "dram_ref_ms": 97.16913733333332,
+      "cxl_ref_ms": 111.48097766666666,
+      "method_ms": 87.98466379999999
+    },
+    {
+      "comparison": "W3[JOB] weisgut_static_column recovery",
+      "recovery_pct": 90.33947043521376,
+      "dram_ref_ms": 97.16913733333332,
+      "cxl_ref_ms": 111.48097766666666,
+      "method_ms": 98.5517369
+    },
+    {
+      "comparison": "W4[shift] our_full run geomeans (A->B, 600s+600s)",
+      "raw_ms": {
+        "1": 8847.429931,
+        "2": 8869.778875,
+        "3": 8803.511803
+      }
+    },
+    {
+      "comparison": "W4[shift] weisgut_static_column run geomeans (A->B, 600s+600s)",
+      "raw_ms": {
+        "1": 9330.133659,
+        "2": 9312.847971,
+        "3": 9647.49138
+      }
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+config,rep,n_items,geomean_avg_ms,n_items_excluded_zero_runs,excluded_items
+weisgut_static_column,2,8,9312.847971,14,TPC-H 02 TPC-H 04 TPC-H 07 TPC-H 08 TPC-H 09 TPC-H 11 TPC-H 12 TPC-H 13 TPC-H 15 TPC-H 16 TPC-H 17 TPC-H 20 TPC-H 21 TPC-H 22

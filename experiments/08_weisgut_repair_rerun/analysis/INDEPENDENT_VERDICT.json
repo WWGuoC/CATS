@@ -1,0 +1,32 @@
+{
+  "phase": "W-repair",
+  "audit_date": "2026-10-04",
+  "status": "PASS_WITH_EVIDENCE_LIMITATIONS",
+  "formal_runs_planned": 56,
+  "formal_runs_present": 56,
+  "old_noop_failure_fixed": true,
+  "steady_state_comparison_usable": true,
+  "adaptation_claim_supported": false,
+  "cpu_utilization_claim_supported": false,
+  "manuscript_ready": "partial",
+  "primary_findings": {
+    "tpch_c05_our_vs_static_pct": 4.0972,
+    "tpch_c10_our_vs_static_pct": 3.8210,
+    "tpch_c20_our_vs_static_pct": 0.2865,
+    "job_our_vs_static_pct": -10.7220,
+    "job_pairs_consistent": "10/10",
+    "job_queries_our_full_faster": "100/113",
+    "w4_phase_a_our_vs_static_pct": -12.0089,
+    "w4_phase_b_our_vs_static_pct": -0.1008,
+    "w4_aggregate_our_vs_static_pct": -6.2437
+  },
+  "evidence_gaps": [
+    "our_full start/end tier maps and NUMA residency are absent",
+    "per-cycle total DRAM usage is absent",
+    "daemon_cpu_ms cannot be equated with system CPU utilization",
+    "byte-budget clamp patch is not included in G1_PATCH.diff",
+    "W4 lacks phase-B residency ratio and time-to-steady-state",
+    "repaired TPCH results cannot be merged directly with unclamped Phase D TPCH results"
+  ],
+  "recommended_action": "Use W2/W3 as a workload-dependent trade-off result; run targeted instrumentation checks before strong mechanism or CPU claims, and audit affected Phase D TPCH cells."
+}

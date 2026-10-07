@@ -1,0 +1,616 @@
+From fa3c61172f1e951cba76212077e50594b758f948 Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Mon, 14 Sep 2026 01:07:46 +0800
+Subject: [PATCH 3/4] EDBT v4 B3: cost_c3_greedy priority provider +
+ calibration loader + BASELINE line
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Third migration policy for the EDBT v4 baseline matrix. Only the priority
+provider differs from our_full/our_freq — candidate set, daemon, byte
+budget, strict-fit mapper (B2), copy/publication path, staging, binary and
+measurement window are shared:
+
+- cost(s, dev) = sum over gamma in {sequential, monotonic, random, point}
+  of calibration(dev, gamma, dtype(s)) x count_gamma(s) x bytes_per_value(s),
+  using the RAW cumulative segment-access-counter classes (no EMA,
+  documented). benefit(s) = cost(s, CXL) - cost(s, DRAM) feeds the shared
+  strict-fit mapper unchanged.
+- Dictionary accesses are counted and reported (dictionary_count,
+  dictionary_handling=excluded_reported) but excluded from the cost model.
+- CLI: --cost_c3_greedy (mutually exclusive with --ablate_d1 and
+  --placement_wfreq, enforced) + --c3_calibration <csv> (required).
+- Calibration loader verifies the full 2 devices x 4 gammas x 5 dtypes
+  grid; local SHA-256 (FIPS 180-4) of the exact file bytes feeds the
+  required startup line:
+  BASELINE cost_c3_greedy version=<GIT_HEAD_SHA1> calibration_sha256=<sha>
+  counter_set=sequential,monotonic,random,point
+- Decision trace: c3 rows fill all pattern counters, dictionary handling,
+  cost_dram/cost_cxl (total_score = cost_cxl - cost_dram; validator 1e-6);
+  semantic columns kept as descriptive fields (rate = raw four-pattern
+  total, norm in [0,1]). Trace rows now carry all 50 columns (B1/B2 wrote
+  6 empty trailing fields instead of 8 — trailing-empty shortfall only,
+  fixed here). Unselected rows with remaining budget > 0 are labeled
+  skip_no_fit (strict-fit size skip; unselected => fits_remaining=false
+  holds by construction).
+
+Smoke (20s JOB, synthetic calibration): BASELINE line digest equals
+sha256sum; 4/4 pattern counters nonzero; per-row recompute of
+cost_dram/cost_cxl from counters x calibration x bytes_per_value matches
+to 0.0 relative error; max selected bytes per cycle exactly 3,725,884,160
+<= budget; zero unselected-but-fits rows.
+---
+ src/benchmark/join_order_benchmark.cpp    |  33 ++-
+ src/lib/types.hpp                         |  18 ++
+ src/plugins/semantic_placement_plugin.cpp | 323 +++++++++++++++++++++-
+ src/plugins/semantic_placement_plugin.hpp |  21 +-
+ 4 files changed, 382 insertions(+), 13 deletions(-)
+
+diff --git a/src/benchmark/join_order_benchmark.cpp b/src/benchmark/join_order_benchmark.cpp
+index d42f63ea9..b26b9dbe6 100644
+--- a/src/benchmark/join_order_benchmark.cpp
++++ b/src/benchmark/join_order_benchmark.cpp
+@@ -179,7 +179,16 @@ int main(int argc, char* argv[]) {
+   ("placement_trace", "[EDBT v4 B1] Observation-only placement trace (default off). Writes "
+                       "<json>_decision_trace.csv + <json>_operator_segment_trace.csv; run identity "
+                       "from EDBT_V4_RUN_ID / EDBT_V4_REP env vars",
+-                      cxxopts::value<bool>()->default_value("false")); // NOLINT
++                      cxxopts::value<bool>()->default_value("false")) // NOLINT
++  ("cost_c3_greedy", "[EDBT v4 B3] Cost-C3 greedy baseline: priority = predicted cost difference "
++                     "cost(CXL) - cost(DRAM) from the calibration table and the raw four-pattern "
++                     "segment access counters (sequential/monotonic/random/point); shares the "
++                     "strict-fit mapper and byte budget; requires --c3_calibration; mutually "
++                     "exclusive with --ablate_d1 and --placement_wfreq",
++                      cxxopts::value<bool>()->default_value("false")) // NOLINT
++  ("c3_calibration", "[EDBT v4 B3] C3 calibration CSV path "
++                     "(device,gamma,data_type,bytes_per_value,ns_per_access_per_byte)",
++                      cxxopts::value<std::string>()->default_value("")); // NOLINT
+   // clang-format on
+ 
+   auto benchmark_config = std::shared_ptr<BenchmarkConfig>{};
+@@ -207,6 +216,8 @@ int main(int argc, char* argv[]) {
+   auto placement_wfreq = false;
+   auto placement_kappa = 1.0f;
+   auto placement_trace = false;
++  auto cost_c3_greedy = false;
++  auto c3_calibration = std::string{};
+ 
+   // Parse command line args
+   const auto cli_parse_result = cli_options.parse(argc, argv);
+@@ -248,6 +259,22 @@ int main(int argc, char* argv[]) {
+   placement_wfreq = cli_parse_result["placement_wfreq"].as<bool>();
+   placement_kappa = cli_parse_result["placement_kappa"].as<float>();
+   placement_trace = cli_parse_result["placement_trace"].as<bool>();
++  cost_c3_greedy = cli_parse_result["cost_c3_greedy"].as<bool>();
++  c3_calibration = cli_parse_result["c3_calibration"].as<std::string>();
++
++  // [EDBT v4 B3] cost_c3_greedy is a third migration policy, not an ablation
++  // arm: it must not be combined with the d1/wfreq priority variants and needs
++  // its calibration table.
++  if (cost_c3_greedy) {
++    if (ablate_d1 || placement_wfreq) {
++      std::cerr << "--cost_c3_greedy is mutually exclusive with --ablate_d1 and --placement_wfreq\n";
++      return 1;
++    }
++    if (c3_calibration.empty()) {
++      std::cerr << "--cost_c3_greedy requires --c3_calibration <csv>\n";
++      return 1;
++    }
++  }
+ 
+   // Check that the options "query_path" and "table_path" were specified
+   if (query_path.empty() || table_path.empty()) {
+@@ -372,7 +399,9 @@ int main(int argc, char* argv[]) {
+                                      .placement_wfreq = placement_wfreq,
+                                      .placement_kappa = placement_kappa,
+                                      .placement_query_path = query_path,
+-                                     .placement_trace = placement_trace};
++                                     .placement_trace = placement_trace,
++                                     .cost_c3_greedy = cost_c3_greedy,
++                                     .c3_calibration_path = c3_calibration};
+ 
+   auto context = BenchmarkRunner::create_context(*benchmark_config);
+   auto table_generator = std::make_unique<FileBasedTableGenerator>(benchmark_config, table_path);
+diff --git a/src/lib/types.hpp b/src/lib/types.hpp
+index b00179bed..e1ceec9c6 100644
+--- a/src/lib/types.hpp
++++ b/src/lib/types.hpp
+@@ -124,6 +124,24 @@ struct PlacementOptions {
+   // EDBT_V4_RUN_ID / EDBT_V4_REP environment variables (harness-controlled),
+   // defaulting to the JSON file stem and rep 1.
+   bool placement_trace = false;
++  // EDBT v4 Phase B (commit B3): cost_c3_greedy baseline priority provider.
++  // cost(s, dev) = Σ_γ calibration(dev, γ, dtype(s)) × count_γ(s) ×
++  // bytes_per_value(s) over the four-pattern counter set
++  // {sequential, monotonic, random, point} of the segment access counter
++  // (raw cumulative values, no EMA; Dictionary accesses are counted but
++  // excluded from the cost model and reported). benefit(s) = cost(s,CXL) −
++  // cost(s,DRAM) feeds the SHARED strict-fit mapper (commit B2) — only the
++  // priority provider differs from our_full/our_freq, never the mapper, byte
++  // budget, copy path, or measurement window. Mutually exclusive with
++  // ablate_d1 and placement_wfreq (enforced by the JOB CLI).
++  bool cost_c3_greedy = false;
++  // Calibration CSV path with columns
++  //   device,gamma,data_type,bytes_per_value,ns_per_access_per_byte
++  // device ∈ {dram, cxl}; gamma ∈ {sequential, monotonic, random, point};
++  // data_type ∈ {int32, int64, float32, float64, string16}. Required when
++  // cost_c3_greedy is set; its SHA-256 is printed in the BASELINE startup
++  // line and recorded by the run harness.
++  std::string c3_calibration_path;
+ };
+ 
+ // The string type that is used internally to store data. It's hard to draw the line between this and std::string or
+diff --git a/src/plugins/semantic_placement_plugin.cpp b/src/plugins/semantic_placement_plugin.cpp
+index f7ea90706..7c79f9e6c 100644
+--- a/src/plugins/semantic_placement_plugin.cpp
++++ b/src/plugins/semantic_placement_plugin.cpp
+@@ -6,6 +6,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <ctime>
+ #include <fstream>
+ #include <iostream>
+@@ -21,6 +22,7 @@
+ #include "storage/segment_access_counter.hpp"
+ #include "storage/table.hpp"
+ #include "utils/assert.hpp"
++#include "version.hpp"
+ 
+ namespace hyrise {
+ 
+@@ -83,6 +85,22 @@ std::optional<PreBenchmarkHook> SemanticPlacementPlugin::pre_benchmark_hook() {
+       _plan_analyzer.set_query_dir(options.placement_query_path);
+     }
+ 
++    // [EDBT v4 B3] cost_c3_greedy: load + verify the calibration table and
++    // print the required BASELINE startup line before any placement work.
++    // version = repo HEAD at plugin build time; calibration_sha256 covers the
++    // exact calibration bytes; the counter set is the segment access counter's
++    // four pattern classes (raw cumulative values, no EMA).
++    _c3_greedy = options.cost_c3_greedy;
++    if (_c3_greedy) {
++      _c3_version = GIT_HEAD_SHA1;
++      if (!load_c3_calibration(options.c3_calibration_path)) {
++        Assert(false, "cost_c3_greedy: calibration table missing/invalid (see log above)");
++      }
++      std::cout << "BASELINE cost_c3_greedy version=" << _c3_version
++                << " calibration_sha256=" << _c3_calibration_sha256
++                << " counter_set=sequential,monotonic,random,point\n";
++    }
++
+     std::cout << "=== SemanticPlacementPlugin pre_benchmark_hook ===\n";
+     if (_dram_first) {
+       std::cout << "- Mode: DRAM-first (data starts on DRAM, demote cold to CXL)\n";
+@@ -433,11 +451,22 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+     bool is_immutable;
+     Tier current_tier;
+     AccessType access_type;
++    // [EDBT v4 B3] cost_c3_greedy inputs (raw cumulative counters, no EMA):
++    // the four pattern classes + the separately reported Dictionary count.
++    uint64_t c3_seq = 0;
++    uint64_t c3_monotonic = 0;
++    uint64_t c3_random = 0;
++    uint64_t c3_point = 0;
++    uint64_t c3_dictionary = 0;
++    uint64_t c3_bytes_per_value = 0;  // from column data type (calibration grid key)
++    double c3_cost_dram = 0.0;        // Σ_γ calib(dram,γ,dtype)·count_γ·bpv
++    double c3_cost_cxl = 0.0;         // Σ_γ calib(cxl,γ,dtype)·count_γ·bpv
+   };
+   auto segments = std::vector<SegmentInfo>{};
+ 
+   uint64_t max_rate = 0;
+   uint64_t max_volume = 1;  // avoid division by zero
++  uint64_t max_c3_pattern_total = 0;  // [B3] max raw Σ(four patterns) for norm_freq
+ 
+   for (auto& [table_name, table] : storage_manager.tables()) {
+     const auto chunk_count = table->chunk_count();
+@@ -483,8 +512,49 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+         if (access_rate > max_rate) max_rate = access_rate;
+         if (volume > max_volume) max_volume = volume;
+ 
++        // [EDBT v4 B3] cost_c3_greedy inputs: raw four-pattern counters read
++        // once per cycle (cumulative values — no EMA, no normalization; the
++        // Dictionary count is reported but excluded from the cost model).
++        auto c3_cost = std::pair<double, double>{0.0, 0.0};  // {dram, cxl}
++        auto c3_counts = std::array<uint64_t, 5>{};          // seq,mon,rand,point,dict
++        auto c3_bytes_per_value = uint64_t{0};
++        if (_c3_greedy) {
++          using SAC = SegmentAccessCounter::AccessType;
++          const auto& counter = segment->access_counter;
++          c3_counts = {counter[SAC::Sequential].load(std::memory_order_relaxed),
++                       counter[SAC::Monotonic].load(std::memory_order_relaxed),
++                       counter[SAC::Random].load(std::memory_order_relaxed),
++                       counter[SAC::Point].load(std::memory_order_relaxed),
++                       counter[SAC::Dictionary].load(std::memory_order_relaxed)};
++          // Calibration dtype key from the column's data type (trace uses the
++          // same mapping). Null columns have no calibration entry; treat them
++          // as 8-byte int64 (documented; JOB has none).
++          const auto dtype = table->column_data_type(col_id);
++          const auto* calib_type = "int64";
++          switch (dtype) {
++            case DataType::Int:    calib_type = "int32"; c3_bytes_per_value = 4; break;
++            case DataType::Long:   calib_type = "int64"; c3_bytes_per_value = 8; break;
++            case DataType::Float:  calib_type = "float32"; c3_bytes_per_value = 4; break;
++            case DataType::Double: calib_type = "float64"; c3_bytes_per_value = 8; break;
++            case DataType::String: calib_type = "string16"; c3_bytes_per_value = 16; break;
++            case DataType::Null:   calib_type = "int64"; c3_bytes_per_value = 8; break;
++          }
++          constexpr auto gammas = std::array<const char*, 4>{"sequential", "monotonic", "random", "point"};
++          for (auto g = size_t{0}; g < 4; ++g) {
++            const auto accesses = static_cast<double>(c3_counts[g]);
++            c3_cost.first += _c3_calibration.at("dram").at(gammas[g]).at(calib_type) *
++                             accesses * static_cast<double>(c3_bytes_per_value);
++            c3_cost.second += _c3_calibration.at("cxl").at(gammas[g]).at(calib_type) *
++                              accesses * static_cast<double>(c3_bytes_per_value);
++          }
++          const auto pattern_total = c3_counts[0] + c3_counts[1] + c3_counts[2] + c3_counts[3];
++          if (pattern_total > max_c3_pattern_total) max_c3_pattern_total = pattern_total;
++        }
++
+         segments.push_back({table_name, chunk_id, col_id, access_rate, volume,
+-                           !chunk->is_mutable(), tier, atype});
++                           !chunk->is_mutable(), tier, atype,
++                           c3_counts[0], c3_counts[1], c3_counts[2], c3_counts[3], c3_counts[4],
++                           c3_bytes_per_value, c3_cost.first, c3_cost.second});
+       }
+     }
+   }
+@@ -513,7 +583,16 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+   // the frequency arm's effective inputs; behavior identical.
+   auto freq_w = std::vector<uint64_t>{};
+   auto max_freq_w = uint64_t{0};
+-  if (_wfreq) {
++  if (_c3_greedy) {
++    // [EDBT v4 B3] cost_c3_greedy provider: benefit(s) = cost(s,CXL) −
++    // cost(s,DRAM), where cost(s,dev) = Σ_γ calibration(dev,γ,dtype(s)) ×
++    // count_γ(s) × bytes_per_value(s) over the raw cumulative four-pattern
++    // counters (computed during enumeration; Dictionary excluded/reported).
++    // Feeds the SAME shared strict-fit mapper — only the score differs.
++    for (size_t i = 0; i < segments.size(); ++i) {
++      priorities.push_back(segments[i].c3_cost_cxl - segments[i].c3_cost_dram);
++    }
++  } else if (_wfreq) {
+     // [IMPL-2] (plan v3 §4, formula A): cost-weighted frequency arm. freq_w(s) =
+     // Σ_a cost(atype(a)); with the per-segment tracked type this equals
+     // cost(atype(s)) × access_rate(s). P(s) is evaluated through the unchanged
+@@ -605,16 +684,18 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+   // bytes never exceed the budget (no boundary-overshoot rows remain at this
+   // commit). Inert when --placement_trace is off.
+   if (_trace_on) {
+-    const auto policy = std::string{_ablate_d1 ? "our_no_plan" : "our_full"};
++    const auto policy = std::string{_c3_greedy ? "cost_c3_greedy"
++                                               : (_ablate_d1 ? "our_no_plan" : "our_full")};
+     const auto phase = trace_phase_label();
+     auto ts = timespec{};
+     clock_gettime(CLOCK_REALTIME, &ts);
+     const auto unix_ts_ns =
+         static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+ 
+-    // Effective priority inputs of the active arm (wfreq replaces the rate and
+-    // neutralizes the atype term exactly like compute_priority's callers do).
+-    const auto max_rate_used = _wfreq ? max_freq_w : max_rate;
++    // Effective priority inputs of the active arm: wfreq replaces the rate and
++    // neutralizes the atype term exactly like compute_priority's callers do;
++    // c3 normalizes the raw four-pattern total (its cost model input).
++    const auto max_rate_used = _c3_greedy ? max_c3_pattern_total : (_wfreq ? max_freq_w : max_rate);
+     const auto atype_name = [](AccessType t) -> const char* {
+       switch (t) {
+         case AccessType::Aggregate:   return "Aggregate";
+@@ -690,6 +771,12 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+           action = "keep";
+           target = "UNCHANGED";
+         }
++      } else if (before > 0) {
++        // bytes > remaining > 0: the strict-fit mapper skipped this segment
++        // for SIZE while budget still remained (schema: skip_no_fit). The
++        // mapper's verdict is "not in the DRAM set" ⇒ CXL side.
++        action = "skip_no_fit";
++        target = "CXL";
+       } else if (seg.current_tier == Tier::Local) {
+         action = "demote";
+         target = "CXL";
+@@ -699,8 +786,12 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+       }
+ 
+       // Features exactly as evaluated by compute_priority (same expressions).
++      // c3 rows keep the semantic columns as descriptive fields (照实), with
++      // rate = raw four-pattern total; total_score for c3 is the C3 benefit
++      // (validated as cost_cxl − cost_dram, not as the semantic term sum).
++      const auto c3_pattern_total = seg.c3_seq + seg.c3_monotonic + seg.c3_random + seg.c3_point;
+       const auto atype = _wfreq ? AccessType::Unknown : seg.access_type;
+-      const auto rate_raw = _wfreq ? freq_w[idx] : seg.access_rate;
++      const auto rate_raw = _c3_greedy ? c3_pattern_total : (_wfreq ? freq_w[idx] : seg.access_rate);
+       const auto norm_freq = max_rate_used > 0 ? static_cast<double>(rate_raw) / max_rate_used : 0.0;
+       const auto norm_volume = max_volume > 0 ? 1.0 - static_cast<double>(seg.data_volume) / max_volume : 0.5;
+       const auto a_score = atype_score_of(atype);
+@@ -729,8 +820,18 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+              fmt_double(kPlacementWAtype * a_score) + "," + fmt_double(kPlacementWFreq * norm_freq) + "," +
+              fmt_double(kPlacementWVolume * norm_volume) + "," + fmt_double(kPlacementWImmutable * imm_score) +
+              "," + fmt_double(card) + "," + _plan_analyzer.operator_mask(seg.table_name, seg.column_id) + "," +
+-             std::to_string(before) + "," + std::to_string(after) +
+-             ",,,,,,\n";  // typed counts / dictionary_handling / cost_*: B3 (cost_c3_greedy) fills these
++             std::to_string(before) + "," + std::to_string(after);
++      if (_c3_greedy) {
++        // C3 columns: raw pattern counters + Dictionary handling + both cost
++        // predictions. dictionary accesses are counted and reported but
++        // excluded from the cost model (quantified separately by the harness).
++        buf += "," + std::to_string(seg.c3_seq) + "," + std::to_string(seg.c3_monotonic) + "," +
++               std::to_string(seg.c3_random) + "," + std::to_string(seg.c3_point) + "," +
++               std::to_string(seg.c3_dictionary) + ",excluded_reported," +
++               fmt_double(seg.c3_cost_dram) + "," + fmt_double(seg.c3_cost_cxl) + "\n";
++      } else {
++        buf += ",,,,,,,,\n";  // 8 empty c3-only columns (semantic policies)
++      }
+     }
+     auto ofs = std::ofstream(_decision_trace_path, std::ios::app);
+     ofs << buf;
+@@ -767,6 +868,208 @@ void SemanticPlacementPlugin::scan_and_migrate() {
+                             snap_bytes_promoted, snap_bytes_demoted, cpu_t0, cycle_wall_start);
+ }
+ 
++// ─────────────────────────────────────────────────────────────────────────────
++// EDBT v4 Phase B (commit B3): SHA-256 (FIPS 180-4) + calibration loader
++// ─────────────────────────────────────────────────────────────────────────────
++namespace {
++
++// Compact local SHA-256 so the plugin can print the calibration digest in the
++// BASELINE startup line without external dependencies.
++class Sha256 {
++ public:
++  Sha256() { reset(); }
++
++  void reset() {
++    _state = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
++              0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
++    _length = 0;
++    _buffer_size = 0;
++  }
++
++  void update(const uint8_t* data, const size_t size) {
++    _length += size;
++    auto remaining = size;
++    while (remaining > 0) {
++      const auto take = std::min(remaining, size_t{64} - _buffer_size);
++      std::memcpy(_buffer + _buffer_size, data, take);
++      _buffer_size += take;
++      data += take;
++      remaining -= take;
++      if (_buffer_size == 64) {
++        compress(_buffer);
++        _buffer_size = 0;
++      }
++    }
++  }
++
++  std::array<uint8_t, 32> digest() {
++    const auto bit_length = _length * 8;
++    const auto one = uint8_t{0x80};
++    update(&one, 1);
++    auto zero = uint8_t{0};
++    while (_buffer_size != 56) update(&zero, 1);
++    auto length_be = std::array<uint8_t, 8>{};
++    for (auto i = 0u; i < 8; ++i) length_be[i] = static_cast<uint8_t>(bit_length >> (56 - 8 * i));
++    update(length_be.data(), 8);
++    auto out = std::array<uint8_t, 32>{};
++    for (auto i = 0u; i < 8; ++i) {
++      out[i * 4 + 0] = static_cast<uint8_t>(_state[i] >> 24);
++      out[i * 4 + 1] = static_cast<uint8_t>(_state[i] >> 16);
++      out[i * 4 + 2] = static_cast<uint8_t>(_state[i] >> 8);
++      out[i * 4 + 3] = static_cast<uint8_t>(_state[i]);
++    }
++    return out;
++  }
++
++ private:
++  static uint32_t rotr(const uint32_t value, const uint32_t bits) {
++    return (value >> bits) | (value << (32 - bits));
++  }
++
++  void compress(const uint8_t* block) {
++    static constexpr auto k = std::array<uint32_t, 64>{
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
++    auto w = std::array<uint32_t, 64>{};
++    for (auto i = 0u; i < 16; ++i) {
++      w[i] = (uint32_t{block[i * 4]} << 24) | (uint32_t{block[i * 4 + 1]} << 16) |
++             (uint32_t{block[i * 4 + 2]} << 8) | uint32_t{block[i * 4 + 3]};
++    }
++    for (auto i = 16u; i < 64; ++i) {
++      const auto s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
++      const auto s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
++      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++    }
++    auto a = _state[0];
++    auto b = _state[1];
++    auto c = _state[2];
++    auto d = _state[3];
++    auto e = _state[4];
++    auto f = _state[5];
++    auto g = _state[6];
++    auto h = _state[7];
++    for (auto i = 0u; i < 64; ++i) {
++      const auto s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
++      const auto ch = (e & f) ^ (~e & g);
++      const auto temp1 = h + s1 + ch + k[i] + w[i];
++      const auto s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
++      const auto maj = (a & b) ^ (a & c) ^ (b & c);
++      const auto temp2 = s0 + maj;
++      h = g;
++      g = f;
++      f = e;
++      e = d + temp1;
++      d = c;
++      c = b;
++      b = a;
++      a = temp1 + temp2;
++    }
++    _state[0] += a; _state[1] += b; _state[2] += c; _state[3] += d;
++    _state[4] += e; _state[5] += f; _state[6] += g; _state[7] += h;
++  }
++
++  std::array<uint32_t, 8> _state;
++  uint64_t _length = 0;
++  uint8_t _buffer[64];
++  size_t _buffer_size = 0;
++};
++
++std::string sha256_hex(const std::string& bytes) {
++  auto sha = Sha256{};
++  sha.update(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
++  const auto digest = sha.digest();
++  auto hex = std::string{};
++  hex.reserve(64);
++  static constexpr auto kHex = "0123456789abcdef";
++  for (const auto byte : digest) {
++    hex += kHex[byte >> 4];
++    hex += kHex[byte & 0x0f];
++  }
++  return hex;
++}
++
++}  // namespace
++
++bool SemanticPlacementPlugin::load_c3_calibration(const std::string& path) {
++  auto in = std::ifstream(path, std::ios::binary);
++  if (!in) {
++    std::cerr << "- [B3] cannot open calibration file: " << path << "\n";
++    return false;
++  }
++  auto bytes = std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
++  _c3_calibration_sha256 = sha256_hex(bytes);
++
++  // Expected columns: device,gamma,data_type,bytes_per_value,ns_per_access_per_byte
++  static const auto kDevices = std::set<std::string>{"dram", "cxl"};
++  static const auto kGammas = std::set<std::string>{"sequential", "monotonic", "random", "point"};
++  static const auto kDtypes = std::array<const char*, 5>{"int32", "int64", "float32", "float64", "string16"};
++
++  _c3_calibration.clear();
++  auto rows = size_t{0};
++  auto stream = std::istringstream{bytes};
++  auto line = std::string{};
++  auto header_seen = false;
++  while (std::getline(stream, line)) {
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    if (line.empty()) continue;
++    auto cols = std::vector<std::string>{};
++    auto col_stream = std::istringstream{line};
++    auto token = std::string{};
++    while (std::getline(col_stream, token, ',')) cols.push_back(token);
++    if (!header_seen) {
++      if (cols.size() < 5 || cols[0] != "device" || cols[1] != "gamma" || cols[2] != "data_type" ||
++          cols[3] != "bytes_per_value" || cols[4] != "ns_per_access_per_byte") {
++        std::cerr << "- [B3] calibration header mismatch: " << line << "\n";
++        return false;
++      }
++      header_seen = true;
++      continue;
++    }
++    if (cols.size() < 5) {
++      std::cerr << "- [B3] calibration short row: " << line << "\n";
++      return false;
++    }
++    if (!kDevices.count(cols[0]) || !kGammas.count(cols[1])) {
++      std::cerr << "- [B3] calibration unknown device/gamma: " << line << "\n";
++      return false;
++    }
++    const auto rate = std::strtod(cols[4].c_str(), nullptr);
++    if (!std::isfinite(rate) || rate <= 0.0) {
++      std::cerr << "- [B3] calibration invalid ns_per_access_per_byte: " << line << "\n";
++      return false;
++    }
++    _c3_calibration[cols[0]][cols[1]][cols[2]] = rate;
++    ++rows;
++  }
++  if (!header_seen || rows == 0) {
++    std::cerr << "- [B3] calibration file has no data rows: " << path << "\n";
++    return false;
++  }
++  // Verify the complete device × gamma × data_type grid so a missing cell can
++  // never silently degrade the cost model.
++  for (const auto& device : kDevices) {
++    for (const auto& gamma : kGammas) {
++      for (const auto* dtype : kDtypes) {
++        if (!_c3_calibration.count(device) || !_c3_calibration.at(device).count(gamma) ||
++            !_c3_calibration.at(device).at(gamma).count(dtype)) {
++          std::cerr << "- [B3] calibration grid incomplete: missing " << device << "/" << gamma << "/"
++                    << dtype << "\n";
++          return false;
++        }
++      }
++    }
++  }
++  std::cout << "- [B3] calibration loaded: " << path << " sha256=" << _c3_calibration_sha256
++            << " rows=" << rows << " (grid 2 devices x 4 gammas x 5 dtypes complete)\n";
++  return true;
++}
++
+ // ─────────────────────────────────────────────────────────────────────────────
+ // EDBT v4 Phase B (commit B1): observation-only trace setup
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -775,7 +1078,7 @@ void SemanticPlacementPlugin::init_trace(const std::string& json_path) {
+   const auto stem = json_path.substr(0, json_path.size() - dot_json_length);
+   _decision_trace_path = stem + "_decision_trace.csv";
+   _operator_trace_path = stem + "_operator_segment_trace.csv";
+-  _trace_config = _ablate_d1 ? "our_freq" : "our_full";  // commit B3 adds cost_c3_greedy
++  _trace_config = _c3_greedy ? "cost_c3_greedy" : (_ablate_d1 ? "our_freq" : "our_full");
+ 
+   // Run identity: harness-controlled env with JSON-stem / rep-1 defaults.
+   if (const auto* env_run_id = std::getenv("EDBT_V4_RUN_ID")) {
+diff --git a/src/plugins/semantic_placement_plugin.hpp b/src/plugins/semantic_placement_plugin.hpp
+index b18b4b7eb..fc29f688c 100644
+--- a/src/plugins/semantic_placement_plugin.hpp
++++ b/src/plugins/semantic_placement_plugin.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -124,6 +125,24 @@ class SemanticPlacementPlugin : public AbstractPlugin {
+   // [IMPL-2] (plan v3 §4): E8 cost-weighted frequency arm (formula A)
+   bool _wfreq = false;
+ 
++  // ── EDBT v4 Phase B (commit B3): cost_c3_greedy baseline provider ─────────
++  // Third migration policy: priority = cost(CXL) − cost(DRAM) from the
++  // calibration table and the RAW four-pattern segment access counters
++  // (sequential/monotonic/random/point; no EMA — documented). Dictionary
++  // accesses are counted and reported but excluded from the cost model
++  // (dictionary_handling=excluded_reported). Feeds the shared strict-fit
++  // mapper of commit B2 unchanged.
++  bool _c3_greedy = false;
++  // calibration[device][gamma][data_type] = ns_per_access_per_byte
++  std::map<std::string, std::map<std::string, std::map<std::string, double>>> _c3_calibration;
++  std::string _c3_calibration_sha256;
++  std::string _c3_version;  // repo HEAD at plugin build time (version.hpp)
++
++  // Parse the calibration CSV, populate _c3_calibration, compute the file's
++  // SHA-256, and verify the full device × gamma × data_type grid is present.
++  // Returns false (with a logged reason) on any malformed input.
++  bool load_c3_calibration(const std::string& path);
++
+   // Daemon thread infrastructure
+   std::thread _daemon_thread;
+   std::atomic<bool> _daemon_running{false};
+@@ -191,7 +210,7 @@ class SemanticPlacementPlugin : public AbstractPlugin {
+   // reference trace once (no per-execution attribution under clients=10).
+   bool _trace_on = false;
+   std::string _trace_run_id;                 // EDBT_V4_RUN_ID env or JSON stem
+-  std::string _trace_config;                 // our_full | our_freq (B3 adds cost_c3_greedy)
++  std::string _trace_config;                 // our_full | our_freq | cost_c3_greedy
+   uint32_t _trace_rep = 1;                   // EDBT_V4_REP env or 1
+   std::string _decision_trace_path;
+   std::string _operator_trace_path;
+-- 
+2.34.1
+

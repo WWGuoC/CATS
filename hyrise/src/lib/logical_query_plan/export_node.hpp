@@ -1,0 +1,29 @@
+#pragma once
+
+#include <memory>
+#include <string>
+
+#include "abstract_non_query_node.hpp"
+#include "import_export/file_type.hpp"
+
+namespace hyrise {
+
+/**
+ * This node type represents the COPY TO management command.
+ */
+class ExportNode : public EnableMakeForLQPNode<ExportNode>, public AbstractNonQueryNode {
+ public:
+  ExportNode(const std::string& init_file_name, const FileType init_file_type);
+
+  std::string description(const DescriptionMode mode = DescriptionMode::Short) const override;
+
+  const std::string file_name;
+  const FileType file_type;
+
+ protected:
+  size_t _on_shallow_hash() const override;
+  std::shared_ptr<AbstractLQPNode> _on_shallow_copy(LQPNodeMapping& /*node_mapping*/) const override;
+  bool _on_shallow_equals(const AbstractLQPNode& rhs, const LQPNodeMapping& /*node_mapping*/) const override;
+};
+
+}  // namespace hyrise

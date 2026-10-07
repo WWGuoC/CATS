@@ -1,0 +1,148 @@
+#include "product.hpp"
+
+#include <cstddef>
+#include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "all_type_variant.hpp"
+#include "operators/abstract_operator.hpp"
+#include "operators/abstract_read_only_operator.hpp"
+#include "storage/chunk.hpp"
+#include "storage/pos_lists/abstract_pos_list.hpp"
+#include "storage/pos_lists/row_id_pos_list.hpp"
+#include "storage/reference_segment.hpp"
+#include "storage/table.hpp"
+#include "storage/table_column_definition.hpp"
+#include "types.hpp"
+#include "utils/assert.hpp"
+
+namespace hyrise {
+Product::Product(const std::shared_ptr<const AbstractOperator>& left,
+                 const std::shared_ptr<const AbstractOperator>& right)
+    : AbstractReadOnlyOperator(OperatorType::Product, left, right) {}
+
+const std::string& Product::name() const {
+  static const auto name = std::string{"Product"};
+  return name;
+}
+
+std::shared_ptr<const Table> Product::_on_execute() {
+  TableColumnDefinitions column_definitions;
+
+  // add columns from left table to output
+  const auto left_input_column_count = left_input_table()->column_count();
+  for (auto column_id = ColumnID{0}; column_id < left_input_column_count; ++column_id) {
+    column_definitions.emplace_back(left_input_table()->column_definitions()[column_id]);
+  }
+
+  // add columns from right table to output
+  const auto right_input_column_count = right_input_table()->column_count();
+  for (auto column_id = ColumnID{0}; column_id < right_input_column_count; ++column_id) {
+    column_definitions.emplace_back(right_input_table()->column_definitions()[column_id]);
+  }
+
+  auto output = std::make_shared<Table>(column_definitions, TableType::References);
+  auto chunk_count_left_table = left_input_table()->chunk_count();
+  auto chunk_count_right_table = right_input_table()->chunk_count();
+
+  for (auto chunk_id_left = ChunkID{0}; chunk_id_left < chunk_count_left_table; ++chunk_id_left) {
+    const auto chunk_left = left_input_table()->get_chunk(chunk_id_left);
+    Assert(chunk_left, "Physically deleted chunk should not reach this point, see get_chunk / #1686.");
+
+    for (auto chunk_id_right = ChunkID{0}; chunk_id_right < chunk_count_right_table; ++chunk_id_right) {
+      const auto chunk_right = right_input_table()->get_chunk(chunk_id_right);
+      Assert(chunk_right, "Physically deleted chunk should not reach this point, see get_chunk / #1686.");
+
+      _add_product_of_two_chunks(output, chunk_id_left, chunk_id_right);
+    }
+  }
+
+  return output;
+}
+
+void Product::_add_product_of_two_chunks(const std::shared_ptr<Table>& output, ChunkID chunk_id_left,
+                                         ChunkID chunk_id_right) {
+  const auto chunk_left = left_input_table()->get_chunk(chunk_id_left);
+  const auto chunk_right = right_input_table()->get_chunk(chunk_id_right);
+
+  // we use an approach here in which we do not have nested loops for left and right but create both sides separately
+  // When the result looks like this:
+  //   l1 r1
+  //   l1 r2
+  //   l1 r3
+  //   l2 r1
+  //   l2 r2
+  //   l2 r3
+  // we can first repeat each line on the left side #rightSide times and then repeat the ascending sequence for the
+  // right side #leftSide times
+
+  std::map<std::shared_ptr<const AbstractPosList>, std::shared_ptr<RowIDPosList>> calculated_pos_lists_left;
+  std::map<std::shared_ptr<const AbstractPosList>, std::shared_ptr<RowIDPosList>> calculated_pos_lists_right;
+
+  Segments output_segments;
+  auto is_left_side = true;
+
+  for (const auto& chunk_in : {chunk_left, chunk_right}) {
+    // reusing the same code for left and right side - using a reference_wrapper is ugly, but better than code
+    // duplication
+    auto table = is_left_side ? left_input_table() : right_input_table();
+
+    const auto column_count = chunk_in->column_count();
+    for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
+      std::shared_ptr<const Table> referenced_table;
+      ColumnID referenced_segment;
+      std::shared_ptr<const AbstractPosList> pos_list_in;
+
+      if (auto reference_segment_in =
+              std::dynamic_pointer_cast<const ReferenceSegment>(chunk_in->get_segment(column_id))) {
+        referenced_table = reference_segment_in->referenced_table();
+        referenced_segment = reference_segment_in->referenced_column_id();
+        pos_list_in = reference_segment_in->pos_list();
+      } else {
+        referenced_table = is_left_side ? left_input_table() : right_input_table();
+        referenced_segment = column_id;
+      }
+
+      // See if we can reuse a PosList that we already calculated - important to use a reference here so that the map
+      // gets updated accordingly.
+      auto& pos_list_out = (is_left_side ? calculated_pos_lists_left : calculated_pos_lists_right)[pos_list_in];
+      if (!pos_list_out) {
+        // can't reuse
+        const auto left_chunk_size = chunk_left->size();
+        const auto right_chunk_size = chunk_right->size();
+        const auto pos_list_size = static_cast<size_t>(left_chunk_size) * right_chunk_size;
+        pos_list_out = std::make_shared<RowIDPosList>();
+        pos_list_out->reserve(pos_list_size);
+        for (auto pos_list_index = size_t{0}; pos_list_index < pos_list_size; ++pos_list_index) {
+          // size_t is sufficient here, because ChunkOffset::max is 2^32 and (2^32 * 2^32 = 2^64)
+          auto offset = is_left_side ? static_cast<ChunkOffset>(pos_list_index / right_chunk_size)
+                                     : static_cast<ChunkOffset>(pos_list_index % right_chunk_size);
+          if (pos_list_in) {
+            pos_list_out->emplace_back((*pos_list_in)[offset]);
+          } else {
+            pos_list_out->emplace_back(is_left_side ? chunk_id_left : chunk_id_right, offset);
+          }
+        }
+      }
+      output_segments.push_back(std::make_shared<ReferenceSegment>(referenced_table, referenced_segment, pos_list_out));
+    }
+
+    is_left_side = false;
+  }
+
+  output->append_chunk(output_segments);
+}
+
+std::shared_ptr<AbstractOperator> Product::_on_deep_copy(
+    const std::shared_ptr<AbstractOperator>& copied_left_input,
+    const std::shared_ptr<AbstractOperator>& copied_right_input,
+    std::unordered_map<const AbstractOperator*, std::shared_ptr<AbstractOperator>>& /*copied_ops*/) const {
+  return std::make_shared<Product>(copied_left_input, copied_right_input);
+}
+
+void Product::_on_set_parameters(const std::unordered_map<ParameterID, AllTypeVariant>& parameters) {}
+
+}  // namespace hyrise

@@ -1,0 +1,25 @@
+# aggregate_calibration_v2 over /home/dameng/CXL_migration/hyrise/results_edbt_v4/02_phase_b2/calibration/calibration_raw_v2.csv
+# rows=480 cells=40
+# checks: grid complete, all cells >= min repeats, working sets > LLC, cell_order is a permutation, single bpv per cell
+
+cell (gamma, dtype): dram med | cxl med | cxl/dram | CI half-width rel
+  sequential int32   : 0.104172 | 0.182579 |   1.75x | 16.8%
+  sequential int64   : 0.071248 | 0.159347 |   2.24x | 0.9%
+  sequential float32 : 0.104228 | 0.181612 |   1.74x | 1.1%
+  sequential float64 : 0.070873 | 0.159637 |   2.25x | 7.2%
+  sequential string16: 0.060820 | 0.148326 |   2.44x | 3.2%
+  monotonic  int32   : 0.629215 | 1.198694 |   1.91x | 2.3%
+  monotonic  int64   : 0.362358 | 1.098151 |   3.03x | 2.7%
+  monotonic  float32 : 0.633179 | 1.218672 |   1.92x | 2.5%
+  monotonic  float64 : 0.361960 | 1.091464 |   3.02x | 2.5%
+  monotonic  string16: 0.272019 | 0.747951 |   2.75x | 2.0%
+  random     int32   : 2.482287 | 4.605068 |   1.86x | 0.8%
+  random     int64   : 1.262011 | 2.382441 |   1.89x | 0.4%
+  random     float32 : 2.541985 | 4.582989 |   1.80x | 0.4%
+  random     float64 : 1.255268 | 2.381316 |   1.90x | 0.8%
+  random     string16: 0.648314 | 1.311000 |   2.02x | 0.7%
+  point      int32   : 2.500376 | 4.594715 |   1.84x | 0.8%
+  point      int64   : 1.275478 | 2.384279 |   1.87x | 0.9%
+  point      float32 : 2.500512 | 4.543949 |   1.82x | 0.8%
+  point      float64 : 1.280517 | 2.384865 |   1.86x | 0.9%
+  point      string16: 0.641303 | 1.338646 |   2.09x | 1.0%

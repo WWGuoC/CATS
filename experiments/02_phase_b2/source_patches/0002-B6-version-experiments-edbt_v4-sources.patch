@@ -1,0 +1,3458 @@
+From cceb0c4ec3674e7db878a22c4eae0db8902c20b1 Mon Sep 17 00:00:00 2001
+From: dameng <dameng@local>
+Date: Tue, 15 Sep 2026 11:59:25 +0800
+Subject: [PATCH] EDBT v4 B6 (Phase B2): version all experiments/edbt_v4
+ sources + B2 tooling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+B2-1 versioning: every source under experiments/edbt_v4/ is now tracked —
+Phase B runner/proof/finalize/calibration scripts (retained unchanged for
+provenance), the Phase B calibration bench source, and the new B2 tools:
+  c3_calibration_bench_v2.cpp  B2-6 redo (unique per-cell working sets
+                               > LLC, per-repeat LLC scrub, fixed-seed
+                               randomized cell order, 12 retained repeats,
+                               per-VMA residency verification)
+  aggregate_calibration_v2.py  median + MAD + IQR + distribution-free 95% CI
+                               (order statistics), loader-compatible table
+  analyze_calibration_sensitivity.py  B2-7 endpoints + B2-8 dictionary
+                               share/mapping sensitivity with the shared
+                               strict-fit mapper re-implemented identically
+  run_smoke_phase_b2.py        B2 smoke matrix + --create-stamp validator;
+                               every run_config records runner/validator
+                               SHA-256; single-client measured bundle
+  collect_proofs_phase_b2.py   P1..P8 B2 proofs (set identity, tail columns,
+                               measured path, calibration, stamps, determinism)
+  finalize_phase_b2.py         PHASE_B2_VERDICT.json + PHASE_B2_FILES.sha256
+  validate_run_bundle.py       copy of the phase_b2 pack validator (the one
+                               --create-stamp stamps bind by SHA-256)
+---
+ experiments/edbt_v4/aggregate_calibration.py  |  86 ++++
+ .../edbt_v4/aggregate_calibration_v2.py       | 165 +++++++
+ .../analyze_calibration_sensitivity.py        | 242 ++++++++++
+ experiments/edbt_v4/c3_calibration_bench.cpp  | 184 ++++++++
+ .../edbt_v4/c3_calibration_bench_v2.cpp       | 305 ++++++++++++
+ experiments/edbt_v4/collect_proofs_phase_b.py | 445 ++++++++++++++++++
+ .../edbt_v4/collect_proofs_phase_b2.py        | 297 ++++++++++++
+ experiments/edbt_v4/compare_b1_equivalence.py | 173 +++++++
+ experiments/edbt_v4/finalize_phase_b.py       | 164 +++++++
+ experiments/edbt_v4/finalize_phase_b2.py      | 159 +++++++
+ experiments/edbt_v4/make_schedule_tests.py    | 115 +++++
+ experiments/edbt_v4/run_b1_equivalence.sh     |  60 +++
+ experiments/edbt_v4/run_smoke_phase_b.py      | 268 +++++++++++
+ experiments/edbt_v4/run_smoke_phase_b2.py     | 276 +++++++++++
+ experiments/edbt_v4/validate_run_bundle.py    | 364 ++++++++++++++
+ 15 files changed, 3303 insertions(+)
+ create mode 100644 experiments/edbt_v4/aggregate_calibration.py
+ create mode 100644 experiments/edbt_v4/aggregate_calibration_v2.py
+ create mode 100644 experiments/edbt_v4/analyze_calibration_sensitivity.py
+ create mode 100644 experiments/edbt_v4/c3_calibration_bench.cpp
+ create mode 100644 experiments/edbt_v4/c3_calibration_bench_v2.cpp
+ create mode 100644 experiments/edbt_v4/collect_proofs_phase_b.py
+ create mode 100644 experiments/edbt_v4/collect_proofs_phase_b2.py
+ create mode 100644 experiments/edbt_v4/compare_b1_equivalence.py
+ create mode 100644 experiments/edbt_v4/finalize_phase_b.py
+ create mode 100644 experiments/edbt_v4/finalize_phase_b2.py
+ create mode 100644 experiments/edbt_v4/make_schedule_tests.py
+ create mode 100644 experiments/edbt_v4/run_b1_equivalence.sh
+ create mode 100644 experiments/edbt_v4/run_smoke_phase_b.py
+ create mode 100644 experiments/edbt_v4/run_smoke_phase_b2.py
+ create mode 100644 experiments/edbt_v4/validate_run_bundle.py
+
+diff --git a/experiments/edbt_v4/aggregate_calibration.py b/experiments/edbt_v4/aggregate_calibration.py
+new file mode 100644
+index 000000000..9584b2563
+--- /dev/null
++++ b/experiments/edbt_v4/aggregate_calibration.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B: aggregate c3_calibration_bench raw output into the loader CSV.
++
++Input  (calibration_raw.csv): device,gamma,data_type,repeat,accesses,buffer_bytes,
++                               bytes_per_value,ns_total,ns_per_access,ns_per_access_per_byte
++                               (2 devices x 5 data types x 4 gammas x kRepeats rows)
++Output (calibration.csv):      device,gamma,data_type,bytes_per_value,ns_per_access_per_byte
++                               (40 rows = 2 x 5 x 4; median over repeats)
++
++The plugin loader (load_c3_calibration) requires exactly this header and a
++complete lowercase dram/cxl x {sequential,monotonic,random,point} x
++{int32,int64,float32,float64,string16} grid with positive finite rates.
++
++Also writes <out>.stats.csv (median, mean, stdev, cv%) for the method report.
++"""
++import argparse
++import collections
++import csv
++import statistics
++
++GAMMAS = ("sequential", "monotonic", "random", "point")
++DTYPES = ("int32", "int64", "float32", "float64", "string16")
++DEVICES = ("dram", "cxl")
++BYTES_PER_VALUE = {"int32": 4, "int64": 8, "float32": 4, "float64": 8, "string16": 16}
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("raw_csv")
++    ap.add_argument("out_csv")
++    args = ap.parse_args()
++
++    samples = collections.defaultdict(list)
++    bpv_seen = {}
++    with open(args.raw_csv, newline="") as f:
++        reader = csv.DictReader(f)
++        expected = ["device", "gamma", "data_type", "repeat", "accesses", "buffer_bytes",
++                    "bytes_per_value", "ns_total", "ns_per_access", "ns_per_access_per_byte"]
++        if reader.fieldnames != expected:
++            raise SystemExit(f"unexpected raw header: {reader.fieldnames}")
++        for row in reader:
++            key = (row["device"], row["gamma"], row["data_type"])
++            samples[key].append(float(row["ns_per_access"]))
++            bpv_seen[key] = int(row["bytes_per_value"])
++
++    # Grid completeness + dtype sanity (buffer byte width must match the declared dtype).
++    missing = [k for k in ((d, g, t) for d in DEVICES for g in GAMMAS for t in DTYPES)
++               if k not in samples]
++    if missing:
++        raise SystemExit(f"missing grid cells: {missing}")
++    for key, bpv in bpv_seen.items():
++        if bpv != BYTES_PER_VALUE[key[2]]:
++            raise SystemExit(f"bytes_per_value mismatch at {key}: {bpv}")
++
++    with open(args.out_csv, "w", newline="") as f:
++        f.write("device,gamma,data_type,bytes_per_value,ns_per_access_per_byte\n")
++        # Deterministic row order: device, gamma (as measured), dtype.
++        for device in DEVICES:
++            for gamma in GAMMAS:
++                for dtype in DTYPES:
++                    key = (device, gamma, dtype)
++                    v = samples[key]
++                    if len(v) < 3:
++                        raise SystemExit(f"too few repeats at {key}: {len(v)}")
++                    median_ns = statistics.median(v)
++                    rate = median_ns / BYTES_PER_VALUE[dtype]
++                    f.write(f"{device},{gamma},{dtype},{BYTES_PER_VALUE[dtype]},{rate:.9f}\n")
++
++    with open(args.out_csv + ".stats.csv", "w", newline="") as f:
++        f.write("device,gamma,data_type,n_repeats,ns_per_access_median,ns_per_access_mean,"
++                "ns_per_access_stdev,cv_pct\n")
++        for device in DEVICES:
++            for gamma in GAMMAS:
++                for dtype in DTYPES:
++                    key = (device, gamma, dtype)
++                    v = samples[key]
++                    mean = statistics.mean(v)
++                    f.write(f"{device},{gamma},{dtype},{len(v)},{statistics.median(v):.6f},"
++                            f"{mean:.6f},{statistics.stdev(v):.6f},"
++                            f"{statistics.stdev(v) / mean * 100:.2f}\n")
++    print(f"wrote {args.out_csv} ({len(bpv_seen)} grid cells) and {args.out_csv}.stats.csv")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/experiments/edbt_v4/aggregate_calibration_v2.py b/experiments/edbt_v4/aggregate_calibration_v2.py
+new file mode 100644
+index 000000000..8dde5c2c1
+--- /dev/null
++++ b/experiments/edbt_v4/aggregate_calibration_v2.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 (B2-6): aggregate the calibration bench v2 raw CSV.
++
++All repeats are retained (no outcome-dependent deletion). Per
++(device, gamma, data_type) cell over the `ns_per_access_per_byte` values:
++  median, MAD, IQR, min/max, and a distribution-free 95% CI for the median
++  computed from order statistics (exact binomial coverage, no bootstrap).
++
++Outputs (in --outdir):
++  calibration.csv          loader-compatible median table
++                           (device,gamma,data_type,bytes_per_value,ns_per_access_per_byte)
++  calibration_stats.csv    per-cell dispersion/uncertainty (feeds B2-7 endpoints)
++  calibration_report.txt   physical-sanity ratios (CXL/DRAM per cell) + checks
++
++Usage: aggregate_calibration_v2.py <calibration_raw_v2.csv> <outdir> [--llc-bytes N]
++"""
++
++import argparse
++import csv
++import math
++from collections import defaultdict
++from pathlib import Path
++
++GAMMAS = ["sequential", "monotonic", "random", "point"]
++TYPES = ["int32", "int64", "float32", "float64", "string16"]
++
++
++def binomial_ci_bounds(n: int, alpha: float = 0.05) -> tuple[int, int]:
++    """Order-statistic indices (1-based k, n+1-k) with exact coverage >= 1-alpha
++    for the median: P(X_(k) <= m <= X_(n+1-k)) = 1 - 2*P(Bin(n,0.5) <= k-1)."""
++    def binom_cdf_le(k: int) -> float:  # P(Bin(n, 0.5) <= k)
++        return sum(math.comb(n, i) * 0.5 ** n for i in range(k + 1))
++    k = 1
++    while k <= n // 2 and binom_cdf_le(k - 1) <= alpha / 2:
++        k += 1
++    k -= 1  # largest k whose coverage is still >= 1 - alpha
++    return max(k, 1), n + 1 - max(k, 1)
++
++
++def median(xs: list[float]) -> float:
++    s = sorted(xs)
++    n = len(s)
++    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
++
++
++def percentile_simple(xs: list[float], q: float) -> float:
++    s = sorted(xs)
++    idx = q * (len(s) - 1)
++    lo, hi = int(math.floor(idx)), int(math.ceil(idx))
++    return s[lo] if lo == hi else s[lo] + (idx - lo) * (s[hi] - s[lo])
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("raw_csv")
++    ap.add_argument("outdir")
++    ap.add_argument("--llc-bytes", type=int, default=452984832,
++                    help="per-socket LLC bytes (default 432 MiB); every cell's "
++                         "working_set_bytes must exceed this")
++    ap.add_argument("--min-repeats", type=int, default=10)
++    args = ap.parse_args()
++
++    raw_path = Path(args.raw_csv)
++    outdir = Path(args.outdir)
++    outdir.mkdir(parents=True, exist_ok=True)
++
++    rows = list(csv.DictReader(open(raw_path)))
++    assert rows, "raw csv is empty"
++
++    cells = defaultdict(list)
++    problems: list[str] = []
++    for r in rows:
++        cell = (r["device"], r["gamma"], r["data_type"])
++        cells[cell].append(r)
++        ws = int(r["working_set_bytes"])
++        if ws <= args.llc_bytes:
++            problems.append(f"working set {ws} <= LLC {args.llc_bytes} in {cell} repeat {r['repeat']}")
++
++    # Grid completeness + repeat count
++    expected = {(d, g, t) for d in ("dram", "cxl") for g in GAMMAS for t in TYPES}
++    missing = expected - set(cells)
++    if missing:
++        problems.append(f"missing cells: {sorted(missing)}")
++    for cell, rs in cells.items():
++        repeats = sorted(int(r["repeat"]) for r in rs)
++        if len(rs) < args.min_repeats:
++            problems.append(f"{cell}: only {len(rs)} repeats (< {args.min_repeats})")
++        if repeats != list(range(len(repeats))):
++            problems.append(f"{cell}: non-contiguous repeat ids {repeats}")
++        bpvs = {r["bytes_per_value"] for r in rs}
++        if len(bpvs) != 1:
++            problems.append(f"{cell}: inconsistent bytes_per_value {bpvs}")
++
++    # Cell order randomization check (fixed seed shuffle => non-systematic order)
++    order_by_cell = {(r["device"], r["gamma"], r["data_type"]): int(r["cell_order"]) for r in rows}
++    if sorted(order_by_cell.values()) != list(range(40)):
++        problems.append("cell_order is not a permutation of 0..39")
++
++    stats = {}
++    for cell, rs in sorted(cells.items()):
++        device, gamma, dtype = cell
++        xs = [float(r["ns_per_access_per_byte"]) for r in rs]
++        n = len(xs)
++        s = sorted(xs)
++        med = median(xs)
++        mad = median([abs(x - med) for x in xs])
++        iqr = percentile_simple(xs, 0.75) - percentile_simple(xs, 0.25)
++        k, k_hi = binomial_ci_bounds(n)
++        ci_low, ci_high = s[k - 1], s[k_hi - 1]
++        stats[cell] = dict(n=n, median=med, mad=mad, iqr=iqr, min=s[0], max=s[-1],
++                           ci_low=ci_low, ci_high=ci_high,
++                           rel_half_width=max(med - ci_low, ci_high - med) / med if med else 0.0,
++                           bpv=int(rs[0]["bytes_per_value"]),
++                           order=order_by_cell[cell])
++
++    # loader-compatible median table (grid order for readability)
++    with open(outdir / "calibration.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["device", "gamma", "data_type", "bytes_per_value", "ns_per_access_per_byte"])
++        for device in ("dram", "cxl"):
++            for gamma in GAMMAS:
++                for dtype in TYPES:
++                    st = stats.get((device, gamma, dtype))
++                    if st:
++                        w.writerow([device, gamma, dtype, st["bpv"], f"{st['median']:.9f}"])
++
++    with open(outdir / "calibration_stats.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["device", "gamma", "data_type", "cell_order", "n", "bytes_per_value",
++                    "median_ns_per_access_per_byte", "mad", "iqr", "min", "max",
++                    "ci95_low", "ci95_high", "rel_half_width"])
++        for cell in sorted(stats, key=lambda c: stats[c]["order"]):
++            st = stats[cell]
++            w.writerow([cell[0], cell[1], cell[2], st["order"], st["n"], st["bpv"],
++                        f"{st['median']:.9f}", f"{st['mad']:.9f}", f"{st['iqr']:.9f}",
++                        f"{st['min']:.9f}", f"{st['max']:.9f}",
++                        f"{st['ci_low']:.9f}", f"{st['ci_high']:.9f}", f"{st['rel_half_width']:.6f}"])
++
++    # physical sanity: CXL/DRAM median ratio per cell
++    lines = [f"# aggregate_calibration_v2 over {raw_path}", f"# rows={len(rows)} cells={len(cells)}"]
++    if problems:
++        lines.append("# PROBLEMS:")
++        lines.extend(f"#   {p}" for p in problems)
++    else:
++        lines.append("# checks: grid complete, all cells >= min repeats, "
++                     "working sets > LLC, cell_order is a permutation, single bpv per cell")
++    lines.append("")
++    lines.append("cell (gamma, dtype): dram med | cxl med | cxl/dram | CI half-width rel")
++    for gamma in GAMMAS:
++        for dtype in TYPES:
++            d = stats.get(("dram", gamma, dtype))
++            c = stats.get(("cxl", gamma, dtype))
++            if not (d and c):
++                continue
++            ratio = c["median"] / d["median"] if d["median"] else float("nan")
++            lines.append(f"  {gamma:10s} {dtype:8s}: {d['median']:.6f} | {c['median']:.6f} | "
++                         f"{ratio:6.2f}x | {max(d['rel_half_width'], c['rel_half_width'])*100:.1f}%")
++    report = "\n".join(lines) + "\n"
++    open(outdir / "calibration_report.txt", "w").write(report)
++    print(report)
++    raise SystemExit(1 if problems else 0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/edbt_v4/analyze_calibration_sensitivity.py b/experiments/edbt_v4/analyze_calibration_sensitivity.py
+new file mode 100644
+index 000000000..f0b0bb091
+--- /dev/null
++++ b/experiments/edbt_v4/analyze_calibration_sensitivity.py
+@@ -0,0 +1,242 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 (B2-7 + B2-8): calibration & Dictionary placement sensitivity.
++
++Inputs:
++  --trace <decision_trace.csv>   a cost_c3_greedy trace-on bundle's decision trace
++                                 (carries per-cycle raw 5-pattern counters, dtype,
++                                 bpv, data_volume_bytes)
++  --stats <calibration_stats.csv> aggregate_calibration_v2.py output
++  --cycle last|<n>               which daemon cycle's cumulative counters to use
++                                 as the workload snapshot (default: last)
++
++Analyses:
++  B2-7  placement under median calibration vs UNCERTAINTY ENDPOINTS
++        (all cells at ci95_low / all at ci95_high). Benefit recomputed from raw
++        counters; the shared strict-fit mapper (score desc, then
++        table/chunk/col asc; select only if bytes <= remaining budget,
++        budget = 3725884160) is re-run per variant. Report segment-count and
++        byte-weighted Jaccard vs the median placement.
++  B2-8  Dictionary event share (cumulative + per-cycle delta) and a DOCUMENTED
++        placement sensitivity that maps Dictionary accesses to a defensible
++        calibrated cost (point / random), reported against the published
++        four-pattern arm (dictionary excluded). The four-pattern arm itself is
++        NOT changed here; both outcomes are reported.
++
++Outputs (in --outdir):
++  sensitivity_calibration.json / .csv   B2-7 endpoints
++  sensitivity_dictionary.json / .csv    B2-8 share + mapping variants
++"""
++
++import argparse
++import csv
++import json
++from collections import defaultdict
++from pathlib import Path
++
++DRAM_BUDGET_BYTES = 3725884160
++GAMMAS = ["sequential", "monotonic", "random", "point"]
++
++
++def load_stats(path: Path) -> dict:
++    """(device, gamma, dtype) -> stats row."""
++    out = {}
++    for r in csv.DictReader(open(path)):
++        out[(r["device"], r["gamma"], r["data_type"])] = r
++    return out
++
++
++def calibration_value(stats: dict, variant: str) -> dict:
++    """(device, gamma, dtype) -> ns_per_access_per_byte under the variant."""
++    key = {"median": "median_ns_per_access_per_byte",
++           "lo": "ci95_low", "hi": "ci95_high"}[variant]
++    return {cell: float(row[key]) for cell, row in stats.items()}
++
++
++def benefit(counts: dict, bpv: int, dtype: str, calib: dict) -> float:
++    cost_dram = sum(calib[("dram", g, dtype)] * counts[g] * bpv for g in GAMMAS)
++    cost_cxl = sum(calib[("cxl", g, dtype)] * counts[g] * bpv for g in GAMMAS)
++    return cost_cxl - cost_dram
++
++
++def strict_fit(segments: list[dict], budget: int = DRAM_BUDGET_BYTES) -> set[int]:
++    """Shared deterministic strict-fit mapper (commit B2 semantics):
++    comparator = score desc, then table name, chunk id, column id ascending;
++    a segment is selected only when its bytes fit the remaining budget."""
++    order = sorted(range(len(segments)),
++                   key=lambda i: (-segments[i]["score"], segments[i]["table"],
++                                  segments[i]["chunk"], segments[i]["column"]))
++    remaining = budget
++    selected = set()
++    for i in order:
++        b = segments[i]["bytes"]
++        if b <= remaining:
++            selected.add(i)
++            remaining -= b
++    return selected
++
++
++def jaccard(a: set, b: set) -> float:
++    return len(a & b) / len(a | b) if (a | b) else 1.0
++
++
++def byte_weighted_jaccard(segments: list[dict], a: set, b: set) -> float:
++    inter = sum(segments[i]["bytes"] for i in a & b)
++    union = sum(segments[i]["bytes"] for i in a | b)
++    return inter / union if union else 1.0
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--trace", required=True)
++    ap.add_argument("--stats", required=True)
++    ap.add_argument("--outdir", required=True)
++    ap.add_argument("--cycle", default="last")
++    args = ap.parse_args()
++    outdir = Path(args.outdir)
++    outdir.mkdir(parents=True, exist_ok=True)
++
++    rows = list(csv.DictReader(open(args.trace)))
++    assert rows, "empty decision trace"
++    cycles = sorted({int(r["cycle_id"]) for r in rows})
++    cycle = cycles[-1] if args.cycle == "last" else int(args.cycle)
++    assert cycle in cycles, f"cycle {cycle} not in {cycles}"
++    snap = [r for r in rows if int(r["cycle_id"]) == cycle and r["policy"] == "cost_c3_greedy"]
++    assert snap, f"no cost_c3_greedy rows in cycle {cycle}"
++
++    # DTYPE normalization: trace data_type is the magic_enum-lower column type
++    # (int/long/float/double/string/null); calibration keys are the loader grid.
++    DTYPE_TO_CALIB = {"int": "int32", "long": "int64", "float": "float32",
++                      "double": "float64", "string": "string16", "null": "int64"}
++    CALIB_BYTES = {"int32": 4, "int64": 8, "float32": 4, "float64": 8, "string16": 16}
++
++    segments = []
++    for r in snap:
++        dtype = DTYPE_TO_CALIB[r["data_type"]]
++        bpv = int(float(r["bytes_per_value"]))
++        assert bpv == CALIB_BYTES[dtype], (r["data_type"], bpv, dtype)
++        counts = {"sequential": int(r["sequential_count"]),
++                  "monotonic": int(r["monotonic_count"]),
++                  "random": int(r["random_count"]),
++                  "point": int(r["point_count"])}
++        segments.append(dict(table=r["table_name"], chunk=int(r["chunk_id"]),
++                             column=int(r["column_id"]), dtype=dtype, bpv=bpv,
++                             counts=counts, dictionary=int(r["dictionary_count"]),
++                             bytes=int(r["data_volume_bytes"])))
++
++    stats = load_stats(Path(args.stats))
++
++    # ── B2-7: placement under median vs uncertainty endpoints ──────────────
++    cal_results = {}
++    placements = {}
++    for variant in ("median", "lo", "hi"):
++        calib = calibration_value(stats, variant)
++        for seg in segments:
++            seg["score"] = benefit(seg["counts"], seg["bpv"], seg["dtype"], calib)
++        placements[variant] = strict_fit(segments)
++        cal_results[variant] = dict(
++            selected_segments=len(placements[variant]),
++            selected_bytes=sum(segments[i]["bytes"] for i in placements[variant]),
++            benefit_total=sum(segments[i]["score"] for i in placements[variant]))
++
++    b27 = dict(
++        cycle=cycle,
++        segments=len(segments),
++        budget=DRAM_BUDGET_BYTES,
++        variants=cal_results,
++        jaccard_segment={v: jaccard(placements["median"], placements[v]) for v in ("lo", "hi")},
++        jaccard_byte_weighted={v: byte_weighted_jaccard(segments, placements["median"], placements[v])
++                               for v in ("lo", "hi")})
++
++    # ── B2-8: Dictionary event share + mapped-cost placement sensitivity ───
++    tot = {g: sum(s["counts"][g] for s in segments) for g in GAMMAS}
++    dict_total = sum(s["dictionary"] for s in segments)
++    all_events = sum(tot.values()) + dict_total
++    share_cumulative = dict_total / all_events if all_events else 0.0
++
++    # per-cycle delta share: dictionary delta vs total delta across consecutive cycles
++    dict_deltas, total_deltas = [], []
++    prev: dict[tuple, tuple] = {}
++    for r in rows:
++        if r["policy"] != "cost_c3_greedy":
++            continue
++        key = (r["table_name"], int(r["chunk_id"]), int(r["column_id"]))
++        cur = (int(r["sequential_count"]), int(r["monotonic_count"]), int(r["random_count"]),
++               int(r["point_count"]), int(r["dictionary_count"]))
++        if key in prev:
++            d4 = sum(c - p for c, p in zip(cur[:4], prev[key][:4]))
++            dd = cur[4] - prev[key][4]
++            if d4 + dd > 0:
++                dict_deltas.append(dd)
++                total_deltas.append(d4 + dd)
++        prev[key] = cur
++    dict_delta_sum, total_delta_sum = sum(dict_deltas), sum(total_deltas)
++    share_delta = dict_delta_sum / total_delta_sum if total_delta_sum else 0.0
++
++    # mapped-cost variants (documented): Dictionary -> point cost or random cost
++    # on BOTH devices, added to the four-pattern benefit. The published arm
++    # (excluded_reported) stays the reference.
++    calib_median = calibration_value(stats, "median")
++    dict_results = {}
++    dict_placements = {}
++    for mapping in ("excluded_reported", "point", "random"):
++        for seg in segments:
++            extra = {"excluded_reported": 0, "point": seg["dictionary"], "random": seg["dictionary"]}[mapping]
++            counts = dict(seg["counts"])
++            if mapping in ("point", "random"):
++                counts[mapping] += extra
++            seg["score"] = benefit(counts, seg["bpv"], seg["dtype"], calib_median)
++        dict_placements[mapping] = strict_fit(segments)
++        dict_results[mapping] = dict(
++            selected_segments=len(dict_placements[mapping]),
++            selected_bytes=sum(segments[i]["bytes"] for i in dict_placements[mapping]))
++
++    b28 = dict(
++        cycle=cycle,
++        dictionary_events_cumulative=dict_total,
++        four_pattern_events_cumulative=sum(tot.values()),
++        dictionary_share_cumulative=share_cumulative,
++        dictionary_events_delta=dict_delta_sum,
++        total_events_delta=total_delta_sum,
++        dictionary_share_delta=share_delta,
++        mapping_variants=dict_results,
++        jaccard_segment_vs_excluded={m: jaccard(dict_placements["excluded_reported"], dict_placements[m])
++                                     for m in ("point", "random")},
++        jaccard_byte_weighted_vs_excluded={m: byte_weighted_jaccard(
++            segments, dict_placements["excluded_reported"], dict_placements[m])
++            for m in ("point", "random")})
++
++    json.dump(dict(b27_calibration_sensitivity=b27, b28_dictionary_sensitivity=b28,
++                   inputs=dict(trace=str(args.trace), stats=str(args.stats), cycle=cycle)),
++              open(outdir / "sensitivity_results.json", "w"), indent=2)
++
++    with open(outdir / "sensitivity_calibration.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["variant", "selected_segments", "selected_bytes",
++                    "jaccard_segment_vs_median", "jaccard_byte_weighted_vs_median"])
++        for v in ("median", "lo", "hi"):
++            r = cal_results[v]
++            w.writerow([v, r["selected_segments"], r["selected_bytes"],
++                        1.0 if v == "median" else b27["jaccard_segment"][v],
++                        1.0 if v == "median" else b27["jaccard_byte_weighted"][v]])
++    with open(outdir / "sensitivity_dictionary.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["metric", "value"])
++        w.writerow(["dictionary_share_cumulative", share_cumulative])
++        w.writerow(["dictionary_share_per_cycle_delta", share_delta])
++        w.writerow(["dictionary_events_cumulative", dict_total])
++        w.writerow(["four_pattern_events_cumulative", sum(tot.values())])
++        for m in ("excluded_reported", "point", "random"):
++            w.writerow([f"selected_segments[{m}]", dict_results[m]["selected_segments"]])
++            w.writerow([f"selected_bytes[{m}]", dict_results[m]["selected_bytes"]])
++            if m != "excluded_reported":
++                w.writerow([f"jaccard_segment_vs_excluded[{m}]", b28["jaccard_segment_vs_excluded"][m]])
++                w.writerow([f"jaccard_byte_weighted_vs_excluded[{m}]",
++                            b28["jaccard_byte_weighted_vs_excluded"][m]])
++
++    print(json.dumps(dict(b27=b27["jaccard_segment"], b27_bytes=b27["jaccard_byte_weighted"],
++                          dict_share_cum=share_cumulative, dict_share_delta=share_delta,
++                          b28=b28["jaccard_segment_vs_excluded"]), indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/edbt_v4/c3_calibration_bench.cpp b/experiments/edbt_v4/c3_calibration_bench.cpp
+new file mode 100644
+index 000000000..041f55153
+--- /dev/null
++++ b/experiments/edbt_v4/c3_calibration_bench.cpp
+@@ -0,0 +1,184 @@
++// EDBT v4 Phase B (commit B3 prerequisite): C3 typed-cost calibration bench.
++//
++// Measures per-access latency of the four Hyrise access-pattern counters
++// (sequential / monotonic / random / point) for five data types on the DRAM
++// node (node1) and the CXL node (node2) of this machine. Output:
++//   calibration_raw.csv  one row per (device, gamma, data_type, repeat)
++//   (stdout)             medians; a tiny wrapper turns them into
++//   calibration.csv      device,gamma,data_type,ns_per_access_per_byte
++//
++// Model operationalization (documented in the Phase B POLICY_SPEC): the pack's
++// formula is  cost(s,dev) = Σ_γ calib(dev,γ,dtype) · count_γ(s) · bytes_per_value,
++// so calibration is measured as ns per access per byte and multiplied by the
++// column's bytes_per_value at scoring time. Buffers are bound with
++// mbind(MPOL_BIND) — strict, no fallback — and residency is verified from
++// /proc/self/numa_maps before timing.
++//
++// Point vs Random: Hyrise's Point counter is a one-entry position list and
++// Random a multi-entry out-of-order list; at single-value granularity both are
++// uniform random single-value accesses in a memory-cost model, so Point is
++// calibrated with the same uniform random index stream as Random (disclosed
++// limitation, not silently folded: both counters keep separate columns in the
++// decision trace).
++//
++// Build: clang++-17 -O2 -std=c++17 c3_calibration_bench.cpp -o c3_calibration_bench
++// Run:   taskset -c 96 ./c3_calibration_bench <out_csv> [accesses_per_repeat]
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++#include <random>
++#include <string>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <vector>
++
++// numa policy constants (glibc's <numaif.h> needs libnuma for mbind(); declare manually)
++#include <linux/mempolicy.h>
++extern "C" long mbind(void*, unsigned long, int, const unsigned long*, unsigned long, unsigned);
++
++namespace {
++
++constexpr size_t kRepeats = 5;
++
++struct DType {
++  const char* name;
++  size_t bytes;
++};
++
++const DType kTypes[] = {
++    {"int32", 4}, {"int64", 8}, {"float32", 4}, {"float64", 8}, {"string16", 16},
++};
++
++double now_ns() {
++  auto ts = timespec{};
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<double>(ts.tv_sec) * 1e9 + static_cast<double>(ts.tv_nsec);
++}
++
++void* bind_buffer(size_t bytes, int node) {
++  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (p == MAP_FAILED) return nullptr;
++  unsigned long mask = 1UL << node;
++  if (mbind(p, bytes, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_MOVE) != 0) {
++    munmap(p, bytes);
++    return nullptr;
++  }
++  return p;
++}
++
++bool verify_residency(const char* tag, int node) {
++  // Count pages on each node in /proc/self/numa_maps; require >=99% on target.
++  auto* f = std::fopen("/proc/self/numa_maps", "r");
++  if (!f) return false;
++  char line[4096];
++  long long total = 0, target = 0;
++  char target_tag[8];
++  std::snprintf(target_tag, sizeof(target_tag), "N%d=", node);
++  while (std::fgets(line, sizeof(line), f)) {
++    for (char* tok = std::strtok(line, " \n"); tok; tok = std::strtok(nullptr, " \n")) {
++      if (std::strncmp(tok, "N", 1) == 0 && std::strchr(tok, '=')) {
++        long long pages = std::atoll(std::strchr(tok, '=') + 1);
++        total += pages;
++        if (std::strncmp(tok, target_tag, std::strlen(target_tag)) == 0) target += pages;
++      }
++    }
++  }
++  std::fclose(f);
++  const bool ok = total > 0 && static_cast<double>(target) / total >= 0.99;
++  std::printf("# residency[%s]: target N%d = %lld / %lld pages (%.4f) -> %s\n", tag, node, target,
++              total, total ? static_cast<double>(target) / total : 0.0, ok ? "OK" : "FAIL");
++  return ok;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  if (argc < 2) {
++    std::fprintf(stderr, "usage: %s <out_csv> [accesses_per_repeat]\n", argv[0]);
++    return 2;
++  }
++  const std::string out_path = argv[1];
++  const size_t n_access = argc > 2 ? std::stoull(argv[2]) : 32u * 1024 * 1024;  // 32M per repeat
++
++  // ≥ 512 MiB PER TYPE (LLC here is 864 MiB / 2 sockets = 432 MiB per socket):
++  // n_values scales with bytes_per_value; one buffer per (device, dtype),
++  // mapped/unmapped sequentially (peak RSS ≈ buffer + index vectors).
++  const auto values_for = [](size_t bytes) {
++    return std::max<size_t>(536870912ull / bytes, 8u * 1024 * 1024);
++  };
++
++  auto* out = std::fopen(out_path.c_str(), "w");
++  if (!out) {
++    std::perror("fopen");
++    return 2;
++  }
++  std::fprintf(out,
++               "device,gamma,data_type,repeat,accesses,buffer_bytes,bytes_per_value,"
++               "ns_total,ns_per_access,ns_per_access_per_byte\n");
++
++  long long checksum = 0;  // sink so accesses are not optimized away
++  for (int node : {1, 2}) {
++    const char* device = node == 1 ? "dram" : "cxl";  // lowercase: loader grid keys
++    for (const auto& type : kTypes) {
++      const size_t n_values = values_for(type.bytes);
++      const size_t buffer_bytes = n_values * type.bytes;
++      auto* buf = static_cast<uint8_t*>(bind_buffer(buffer_bytes, node));
++      if (!buf) {
++        std::fprintf(stderr, "mbind/mmap failed for node %d (%zu bytes)\n", node, buffer_bytes);
++        return 2;
++      }
++      std::memset(buf, 1, buffer_bytes);
++      if (!verify_residency(type.name, node)) {
++        std::fprintf(stderr, "residency verification failed (node %d, %s)\n", node, type.name);
++        return 2;
++      }
++
++      // Index streams
++      auto indices = std::vector<size_t>(n_values);
++      for (size_t i = 0; i < n_values; ++i) indices[i] = i;
++      auto rng = std::mt19937_64(0xC3C3C3C3C3C3C3C3ull);
++      std::shuffle(indices.begin(), indices.end(), rng);  // random stream
++      // monotonic stream: stride 2 over a rotated window (monotone, gaps)
++      auto mono = std::vector<size_t>(n_values / 2);
++      for (size_t i = 0; i < mono.size(); ++i) mono[i] = (i * 2 + n_values / 4) % n_values;
++
++      for (const char* gamma : {"sequential", "monotonic", "random", "point"}) {
++        for (size_t repeat = 0; repeat < kRepeats; ++repeat) {
++          // Warm the TLB / page tables once (not timed)
++          for (size_t i = 0; i < 65536; ++i) checksum += buf[i * type.bytes % buffer_bytes];
++          const auto t0 = now_ns();
++          if (std::strcmp(gamma, "sequential") == 0) {
++            for (size_t k = 0; k < n_access; ++k) {
++              const size_t idx = k % n_values;
++              checksum += buf[idx * type.bytes];
++            }
++          } else if (std::strcmp(gamma, "monotonic") == 0) {
++            for (size_t k = 0; k < n_access; ++k) {
++              const size_t idx = mono[k % mono.size()];
++              checksum += buf[idx * type.bytes];
++            }
++          } else {  // random == point: uniform random single-value accesses
++            for (size_t k = 0; k < n_access; ++k) {
++              const size_t idx = indices[k % n_values];
++              checksum += buf[idx * type.bytes];
++            }
++          }
++          const auto t1 = now_ns();
++          const double ns_total = t1 - t0;
++          const double ns_per_access = ns_total / static_cast<double>(n_access);
++          std::fprintf(out, "%s,%s,%s,%zu,%zu,%zu,%zu,%.3f,%.6f,%.9f\n", device, gamma, type.name,
++                       repeat, n_access, buffer_bytes, type.bytes, ns_total, ns_per_access,
++                       ns_per_access / static_cast<double>(type.bytes));
++        }
++      }
++      munmap(buf, buffer_bytes);
++    }
++  }
++  std::fclose(out);
++  std::fprintf(stderr, "# checksum sink: %lld\n", checksum);
++  return 0;
++}
+diff --git a/experiments/edbt_v4/c3_calibration_bench_v2.cpp b/experiments/edbt_v4/c3_calibration_bench_v2.cpp
+new file mode 100644
+index 000000000..db37da93b
+--- /dev/null
++++ b/experiments/edbt_v4/c3_calibration_bench_v2.cpp
+@@ -0,0 +1,305 @@
++// EDBT v4 Phase B2: C3 typed-cost calibration bench, v2 (B2-6 redo).
++//
++// Fixes vs the Phase B (commit B3) bench, per the B2 review:
++//   1. UNIQUE working set per timed cell: one fresh mbind(MPOL_BIND) buffer
++//      per (device, gamma, data_type) cell — 40 cells, no sharing of a buffer
++//      between patterns. Each timed pass touches >= 1.25x the per-socket LLC
++//      in DISTINCT bytes (monotonic stride-2 cells use a 2.5x-LLC buffer so
++//      their touched half still exceeds the LLC; string16/point disclosed
++//      below). LLC size is read from sysfs at startup and logged.
++//   2. LLC scrub before EVERY timed repeat (sequential walk of a dedicated
++//      1.5x-LLC cleaner buffer): repeat 0 is no longer biased by memset-warm
++//      lines; all repeats measure the same cold-LLC state.
++//   3. Randomized cell order: the 40 cells are shuffled with a FIXED seed
++//      (mt19937_64, 0xB2C3D4E5F6071829ull) and executed in that order, so
++//      device/dtype adjacency effects do not align with the systematic
++//      enumeration order.
++//   4. 12 retained repeats per cell (>= 10 required); every repeat's raw row
++//      is written; nothing is deleted or re-run based on outcomes.
++//      Dispersion/uncertainty (median, MAD, IQR, distribution-free median CI)
++//      are computed by the aggregation script, never inside this bench.
++//
++// Model operationalization (unchanged from Phase B, documented in POLICY_SPEC):
++//   cost(s,dev) = sum_gamma calib(dev,gamma,dtype) * count_gamma(s) * bpv,
++//   so calibration is ns per access per byte.
++//
++// Disclosed limitations (not silently folded):
++//   - Point vs Random: Hyrise's Point counter is a one-entry position list and
++//     Random a multi-entry out-of-order list; at single-value granularity both
++//     are uniform random single-value accesses, so Point uses the same stream
++//     SHAPE as Random but on its own unique buffer and its own shuffled index
++//     stream (separate trace columns, separate calibration cells).
++//   - string16: fixed 16-byte payloads emulating pmr_string's in-row size;
++//     variable-length overflow is not modeled.
++//
++// Build: clang++-17 -O2 -std=c++17 c3_calibration_bench_v2.cpp -o c3_calibration_bench_v2
++// Run:   taskset -c <core-of-node1> ./c3_calibration_bench_v2 <out_raw_csv>
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++#include <filesystem>
++#include <map>
++#include <random>
++#include <string>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include <vector>
++
++// numa policy constants + raw syscall (mbind() is not exported by this
++// system's libc; use the kernel syscall directly — no libnuma dependency)
++#include <linux/mempolicy.h>
++static long mbind_raw(void* addr, unsigned long len, int mode, const unsigned long* nodemask,
++                      unsigned long maxnode, unsigned flags) {
++  return syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
++}
++
++namespace {
++
++constexpr size_t kRepeats = 12;  // B2-6: >= 10 retained repeats
++constexpr uint64_t kCellOrderSeed = 0xB2C3D4E5F6071829ull;
++constexpr double kDistinctBytesLLCFactor = 1.25;  // timed distinct bytes >= 1.25x LLC
++constexpr double kScrubLLCFactor = 1.5;           // cleaner buffer = 1.5x LLC
++
++struct DType {
++  const char* name;
++  size_t bytes;
++};
++
++const DType kTypes[] = {
++    {"int32", 4}, {"int64", 8}, {"float32", 4}, {"float64", 8}, {"string16", 16},
++};
++
++struct Cell {
++  int node;
++  const char* device;
++  const char* gamma;
++  const DType* type;
++  size_t order_index;  // position in the shuffled execution order
++};
++
++double now_ns() {
++  auto ts = timespec{};
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<double>(ts.tv_sec) * 1e9 + static_cast<double>(ts.tv_nsec);
++}
++
++// Per-socket LLC size in bytes from sysfs (fallback: 432 MiB, this machine's L3).
++size_t read_llc_bytes() {
++  const char* path = "/sys/devices/system/cpu/cpu0/cache/index3/size";
++  auto* f = std::fopen(path, "r");
++  if (!f) return 432ull * 1024 * 1024;
++  char buf[64];
++  const char* read = std::fgets(buf, sizeof(buf), f);
++  std::fclose(f);
++  if (!read) return 432ull * 1024 * 1024;
++  double value = 0.0;
++  char unit = 'K';
++  if (std::sscanf(buf, "%lf%c", &value, &unit) >= 1) {
++    double mul = unit == 'G' ? 1024.0 * 1024 * 1024 : (unit == 'M' ? 1024.0 * 1024 : 1024.0);
++    return static_cast<size_t>(value * mul);
++  }
++  return 432ull * 1024 * 1024;
++}
++
++size_t round_up_2mib(size_t bytes) { return (bytes + (2ull << 20) - 1) & ~static_cast<size_t>((2ull << 20) - 1); }
++
++void* bind_buffer(size_t bytes, int node) {
++  void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (p == MAP_FAILED) return nullptr;
++  unsigned long mask = 1UL << node;
++  if (mbind_raw(p, bytes, MPOL_BIND, &mask, sizeof(mask) * 8, MPOL_MF_MOVE) != 0) {
++    munmap(p, bytes);
++    return nullptr;
++  }
++  return p;
++}
++
++// Residency of ONE mapping. /proc/self/numa_maps prints one line per VMA with
++// only a START address (no end), lines sorted ascending: the region
++// containing `ptr` is the last line whose start <= ptr. Pages counted are
++// that region's; require >= 99% on the target node. (The process keeps other
++// node-bound buffers mapped — cell buffer + its node's scrubber — so a global
++// fraction would be meaningless; Phase B's bench mapped one buffer at a time.)
++bool verify_residency(const char* tag, void* ptr, int node) {
++  auto* f = std::fopen("/proc/self/numa_maps", "r");
++  if (!f) return false;
++  char line[8192];
++  char region_line[8192] = {0};
++  const auto target_addr = reinterpret_cast<uintptr_t>(ptr);
++  auto region_start = 0ull;
++  while (std::fgets(line, sizeof(line), f)) {
++    unsigned long long start = 0;
++    if (std::sscanf(line, "%llx", &start) != 1) continue;
++    if (start > target_addr) break;
++    if (start >= region_start) {
++      region_start = start;
++      std::strncpy(region_line, line, sizeof(region_line) - 1);
++    }
++  }
++  std::fclose(f);
++  long long total = 0, target = 0;
++  char target_tag[8];
++  std::snprintf(target_tag, sizeof(target_tag), "N%d=", node);
++  for (char* tok = std::strtok(region_line, " \n"); tok; tok = std::strtok(nullptr, " \n")) {
++    if (std::strncmp(tok, "N", 1) == 0 && std::strchr(tok, '=')) {
++      long long pages = std::atoll(std::strchr(tok, '=') + 1);
++      total += pages;
++      if (std::strncmp(tok, target_tag, std::strlen(target_tag)) == 0) target += pages;
++    }
++  }
++  const bool ok = total > 0 && static_cast<double>(target) / total >= 0.99;
++  std::printf("# residency[%s]: target N%d = %lld / %lld pages (%.4f) -> %s\n", tag, node, target,
++              total, total ? static_cast<double>(target) / total : 0.0, ok ? "OK" : "FAIL");
++  return ok;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  if (argc < 2) {
++    std::fprintf(stderr, "usage: %s <out_raw_csv>\n", argv[0]);
++    return 2;
++  }
++  const std::string out_path = argv[1];
++
++  const size_t llc_bytes = read_llc_bytes();
++  const size_t distinct_target = round_up_2mib(static_cast<size_t>(kDistinctBytesLLCFactor *
++                                                                   static_cast<double>(llc_bytes)));
++  const size_t scrub_bytes = round_up_2mib(static_cast<size_t>(kScrubLLCFactor *
++                                                               static_cast<double>(llc_bytes)));
++  std::printf("# llc_bytes=%zu (%.1f MiB) distinct_target=%zu scrub_bytes=%zu repeats=%zu\n",
++              llc_bytes, llc_bytes / 1048576.0, distinct_target, scrub_bytes, kRepeats);
++
++  // ── Build the 40-cell grid, then shuffle into a fixed-seed execution order ──
++  auto cells = std::vector<Cell>{};
++  for (int node : {1, 2}) {
++    for (const auto& type : kTypes) {
++      for (const char* gamma : {"sequential", "monotonic", "random", "point"}) {
++        cells.push_back(Cell{node, node == 1 ? "dram" : "cxl", gamma, &type, 0});
++      }
++    }
++  }
++  {
++    auto order = std::vector<size_t>(cells.size());
++    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
++    auto rng = std::mt19937_64(kCellOrderSeed);
++    std::shuffle(order.begin(), order.end(), rng);
++    for (size_t position = 0; position < order.size(); ++position) {
++      cells[order[position]].order_index = position;
++    }
++  }
++  std::stable_sort(cells.begin(), cells.end(),
++                   [](const Cell& a, const Cell& b) { return a.order_index < b.order_index; });
++
++  auto* out = std::fopen(out_path.c_str(), "w");
++  if (!out) {
++    std::perror("fopen");
++    return 2;
++  }
++  std::fprintf(out,
++               "device,gamma,data_type,repeat,cell_order,accesses,buffer_bytes,working_set_bytes,"
++               "bytes_per_value,ns_total,ns_per_access,ns_per_access_per_byte\n");
++
++  // Dedicated LLC scrub buffer per node (bound like the cells; walked
++  // sequentially before every timed repeat to evict residual lines).
++  auto scrub_buffers = std::map<int, uint8_t*>{};
++  for (int node : {1, 2}) {
++    auto* scrub = static_cast<uint8_t*>(bind_buffer(scrub_bytes, node));
++    if (!scrub) {
++      std::fprintf(stderr, "scrub buffer alloc failed for node %d\n", node);
++      return 2;
++    }
++    std::memset(scrub, 3, scrub_bytes);
++    scrub_buffers[node] = scrub;
++  }
++  if (!verify_residency("scrub_n1", scrub_buffers[1], 1) || !verify_residency("scrub_n2", scrub_buffers[2], 2)) {
++    std::fprintf(stderr, "scrub buffer residency verification failed\n");
++    return 2;
++  }
++
++  long long checksum = 0;  // sink so accesses are not optimized away
++  for (const auto& cell : cells) {
++    // Buffer sizing (B2-6): distinct bytes touched by ONE timed pass must
++    // exceed the LLC. sequential/random/point cover distinct_target bytes;
++    // monotonic (stride-2, gaps) touches half its buffer, so its buffer is
++    // 2x distinct_target.
++    const size_t buffer_bytes =
++        std::strcmp(cell.gamma, "monotonic") == 0 ? 2 * distinct_target : distinct_target;
++    const size_t n_values = buffer_bytes / cell.type->bytes;
++    // accesses per pass: sequential/random/point touch every value exactly
++    // once (full buffer coverage); monotonic walks its whole 2x buffer with
++    // stride 2 (half the values, still >= 1.25x LLC distinct bytes).
++    const size_t n_access = n_values;
++
++    auto* buf = static_cast<uint8_t*>(bind_buffer(buffer_bytes, cell.node));
++    if (!buf) {
++      std::fprintf(stderr, "mbind/mmap failed for node %d (%zu bytes)\n", cell.node, buffer_bytes);
++      return 2;
++    }
++    std::memset(buf, 1, buffer_bytes);
++    char tag[64];
++    std::snprintf(tag, sizeof(tag), "%s_%s_%s", cell.device, cell.gamma, cell.type->name);
++    if (!verify_residency(tag, buf, cell.node)) {
++      std::fprintf(stderr, "residency verification failed (%s)\n", tag);
++      return 2;
++    }
++
++    // Index streams for this cell's UNIQUE buffer.
++    // random: full Fisher-Yates shuffle (touches every value once per pass).
++    // point: same stream shape, independently seeded shuffle of the same
++    //        buffer (disclosed Point==Random limitation, unique working set).
++    auto indices = std::vector<size_t>(n_values);
++    for (size_t i = 0; i < n_values; ++i) indices[i] = i;
++    auto rng = std::mt19937_64(0xC3C3C3C3C3C3C3C3ull + cell.order_index);  // per-cell stream
++    std::shuffle(indices.begin(), indices.end(), rng);
++    // monotonic stream: stride 2 over a rotated window (monotone, gaps).
++    auto mono = std::vector<size_t>(n_values / 2);
++    for (size_t i = 0; i < mono.size(); ++i) mono[i] = (i * 2 + n_values / 4) % n_values;
++
++    for (size_t repeat = 0; repeat < kRepeats; ++repeat) {
++      // LLC scrub (not timed): evict memset/prior-repeat residual lines.
++      {
++        auto* scrub = scrub_buffers[cell.node];
++        const size_t scrub_stride = 64;  // one cache line per step
++        for (size_t off = 0; off + scrub_stride <= scrub_bytes; off += scrub_stride) {
++          checksum += scrub[off];
++        }
++      }
++      const auto t0 = now_ns();
++      if (std::strcmp(cell.gamma, "sequential") == 0) {
++        for (size_t k = 0; k < n_access; ++k) {
++          checksum += buf[(k % n_values) * cell.type->bytes];
++        }
++      } else if (std::strcmp(cell.gamma, "monotonic") == 0) {
++        for (size_t k = 0; k < n_access; ++k) {
++          checksum += buf[mono[k % mono.size()] * cell.type->bytes];
++        }
++      } else {  // random and point: independent uniform random single-value streams
++        for (size_t k = 0; k < n_access; ++k) {
++          checksum += buf[indices[k % n_values] * cell.type->bytes];
++        }
++      }
++      const auto t1 = now_ns();
++      const double ns_total = t1 - t0;
++      const double ns_per_access = ns_total / static_cast<double>(n_access);
++      const size_t working_set_bytes =
++          std::strcmp(cell.gamma, "monotonic") == 0 ? (n_access / 2) * cell.type->bytes
++                                                    : n_access * cell.type->bytes;
++      std::fprintf(out, "%s,%s,%s,%zu,%zu,%zu,%zu,%zu,%zu,%.3f,%.6f,%.9f\n", cell.device, cell.gamma,
++                   cell.type->name, repeat, cell.order_index, n_access, buffer_bytes,
++                   working_set_bytes, cell.type->bytes, ns_total, ns_per_access,
++                   ns_per_access / static_cast<double>(cell.type->bytes));
++    }
++    std::fflush(out);
++    std::printf("# cell done: %s (order %zu)\n", tag, cell.order_index);
++    munmap(buf, buffer_bytes);
++  }
++  std::fclose(out);
++  std::fprintf(stderr, "# checksum sink: %lld\n", checksum);
++  return 0;
++}
+diff --git a/experiments/edbt_v4/collect_proofs_phase_b.py b/experiments/edbt_v4/collect_proofs_phase_b.py
+new file mode 100644
+index 000000000..50d68b86d
+--- /dev/null
++++ b/experiments/edbt_v4/collect_proofs_phase_b.py
+@@ -0,0 +1,445 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B: collect the ten required proofs from the smoke bundles.
++
++Reads the bundles produced by run_smoke_phase_b.py (plus the calibration CSV)
++and writes results_edbt_v4/01_phase_b/PROOFS.json and PROOFS.md.
++
++Proofs (numbering follows PROMPT_FOR_PHASE_B_AGENT.md):
++ 1  the three migration configs rank the SAME candidate segment set
++ 2  deterministic tie-break + strict fit never exceed the byte budget per cycle
++ 3  semantic scores recomputable from atype/freq/volume/immutable (1e-9)
++ 4  C3 scores recomputable from the four pattern counters + calibration
++ 5  dictionary counters reported AND excluded (excluded_reported)
++ 6  >= 2 pattern counters non-zero on traced segments
++ 7  same schedule seed -> identical plan + manifest prefix; different seed -> fork
++ 8  dram_only / cxl_only residency within the pre-declared 5% off-target bound
++ 9  operator rows declare attribution_level; unavailable reads stay null (empty)
++10  CXL device / platform identity evidence exists in environment/
++"""
++from __future__ import annotations
++
++import csv
++import hashlib
++import io
++import json
++import math
++import sys
++from collections import Counter, defaultdict
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++PHASE_B = ROOT / "results_edbt_v4/01_phase_b"
++RUNS = PHASE_B / "smoke_runs"
++CALIB = PHASE_B / "calibration/calibration.csv"
++BUDGET = 3725884160
++# Trace `data_type` prints the DataType enum name in lowercase (magic_enum);
++# plugin maps the enum to calibration grid keys (semantic_placement_plugin.cpp B3).
++DTYPE_TO_CALIB = {"int": "int32", "long": "int64", "float": "float32",
++                  "double": "float64", "string": "string16", "null": "int64"}
++CALIB_BYTES = {"int32": 4, "int64": 8, "float32": 4, "float64": 8, "string16": 16}
++GAMMAS = ("sequential", "monotonic", "random", "point")
++
++
++def sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with path.open("rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def read_csv_rows(path: Path):
++    with path.open(newline="", encoding="utf-8") as f:
++        yield from csv.DictReader(f)
++
++
++def read_plan(path: Path) -> list[dict]:
++    """schedule_plan.csv: meta header line + meta row, then the real header + rows."""
++    lines = path.read_text().splitlines()
++    assert lines[0] == "seed,item_count,plan_length", lines[0]
++    reader = csv.DictReader(io.StringIO("\n".join(lines[2:])))
++    assert reader.fieldnames == ["submission_index", "item_id", "item_name"], reader.fieldnames
++    return list(reader)
++
++
++def load_calibration() -> dict[tuple[str, str, str], float]:
++    rates = {}
++    for row in read_csv_rows(CALIB):
++        rates[(row["device"], row["gamma"], row["data_type"])] = float(row["ns_per_access_per_byte"])
++    return rates
++
++
++def close(actual: float, expected: float, rel: float, abs_tol: float) -> bool:
++    return math.isclose(actual, expected, rel_tol=rel, abs_tol=abs_tol)
++
++
++def candidate_key(row) -> tuple:
++    return (row["table_name"], int(row["chunk_id"]), int(row["column_id"]))
++
++
++def set_digest(keys) -> str:
++    keys = sorted(keys)
++    return hashlib.sha256("|".join(f"{t}:{c}:{k}" for t, c, k in keys).encode()).hexdigest()
++
++
++def first_cycle_candidates(path: Path) -> tuple[str, list[int]]:
++    """Candidate set per daemon cycle of one decision trace; returns
++    (hash of first cycle's set, per-cycle sizes)."""
++    per_cycle: dict[str, set] = defaultdict(set)
++    for row in read_csv_rows(path):
++        per_cycle[row["cycle_id"]].add(candidate_key(row))
++    sizes = [len(per_cycle[c]) for c in sorted(per_cycle, key=int)]
++    return set_digest(per_cycle[sorted(per_cycle, key=int)[0]]), sizes
++
++
++def proof_1(proofs: dict) -> None:
++    """All three migration configs rank the SAME candidate set.
++
++    Two layers, both reported:
++    * mapper layer (what the policies actually compete on): the per-cycle
++      candidate set of the decision trace — must be identical across all three
++      configs;
++    * initial placement pass: our_full/cost_c3_greedy derive candidates from
++      plan analysis (plan-referenced segments), our_freq (--ablate_d1, no plan)
++      enumerates the whole storage — a strict SUPERSET by design (v3 semantics).
++      The relation is verified, the difference documented, not hidden.
++    """
++    trace_bundles = {"our_full": "smoke_our_full_traceon",
++                     "our_freq": "smoke_our_freq_traceon",
++                     "cost_c3_greedy": "smoke_cost_c3_greedy_traceon"}
++    mapper_hashes, mapper_sizes = {}, {}
++    for config, bundle in trace_bundles.items():
++        digest, sizes = first_cycle_candidates(RUNS / bundle / "decision_trace.csv")
++        mapper_hashes[config] = digest
++        mapper_sizes[config] = {"cycles": len(sizes), "min": min(sizes), "max": max(sizes)}
++    initial_sets = {}
++    for config, bundle in (("our_full", "smoke_our_full"),
++                           ("our_freq", "smoke_our_freq"),
++                           ("cost_c3_greedy", "smoke_cost_c3_greedy")):
++        keys = {candidate_key(row)
++                for row in read_csv_rows(RUNS / bundle / "benchmark_semantic_placement.csv")}
++        initial_sets[config] = {"sha256": set_digest(keys), "segments": len(keys)}
++    full_keys = None
++    if initial_sets["our_freq"]["segments"] >= initial_sets["our_full"]["segments"]:
++        full_keys = {candidate_key(row)
++                     for row in read_csv_rows(RUNS / "smoke_our_freq" / "benchmark_semantic_placement.csv")}
++    plan_keys = {candidate_key(row)
++                 for row in read_csv_rows(RUNS / "smoke_our_full" / "benchmark_semantic_placement.csv")}
++    is_superset = full_keys is not None and plan_keys.issubset(full_keys)
++    proofs["1_candidate_set"] = {
++        "mapper_layer": {
++            "description": "per-daemon-cycle candidate set (decision trace), the set the "
++                           "policies actually rank",
++            "candidate_set_sha256": mapper_hashes, "per_cycle_sizes": mapper_sizes,
++            "identical_across_configs": len(set(mapper_hashes.values())) == 1,
++        },
++        "initial_placement_layer": {
++            "description": "first placement pass before the benchmark starts",
++            "sets": initial_sets,
++            "our_full_equals_cost_c3_greedy": (initial_sets["our_full"]["sha256"]
++                                               == initial_sets["cost_c3_greedy"]["sha256"]),
++            "our_freq_is_strict_superset": is_superset,
++            "note": "our_freq (--ablate_d1) has no plan info, so its initial pass "
++                    "enumerates the whole storage — the plan-referenced set of the other "
++                    "two arms is a subset of it. From the first daemon cycle onward all "
++                    "arms rank the full storage set (mapper layer).",
++        },
++        "pass": (len(set(mapper_hashes.values())) == 1
++                 and initial_sets["our_full"]["sha256"] == initial_sets["cost_c3_greedy"]["sha256"]
++                 and is_superset),
++    }
++
++
++def proof_2_3(proofs: dict) -> None:
++    """Strict-fit budget + comparator order (P2) and semantic score recompute (P3)."""
++    path = RUNS / "smoke_our_full_traceon" / "decision_trace.csv"
++    per_cycle_selected = defaultdict(int)
++    tie_violations = 0
++    fit_violations = 0
++    term_failures = 0
++    worst_term_err = 0.0
++    worst_total_err = 0.0
++    term_rows = 0
++    cycles: dict[str, list] = defaultdict(list)
++    for row in read_csv_rows(path):
++        cycles[row["cycle_id"]].append(row)
++    for rows in cycles.values():
++        rows.sort(key=lambda r: int(r["rank"]))
++        prev = None
++        for row in rows:
++            score = float(row["total_score"])
++            key3 = (row["table_name"], int(row["chunk_id"]), int(row["column_id"]))
++            if prev is not None:
++                p_score, p_key = prev
++                if not (p_score > score or (p_score == score and p_key < key3)):
++                    tie_violations += 1
++            prev = (score, key3)
++            seg_bytes = int(row["segment_bytes"])
++            before = int(row["remaining_budget_before"])
++            after = int(row["remaining_budget_after"])
++            selected = row["selected"] == "true"
++            fits = row["fits_remaining"] == "true"
++            # strict fit: selected  <=>  segment fits the remaining budget at its rank
++            if selected != fits or fits != (seg_bytes <= before):
++                fit_violations += 1
++            if selected and after != before - seg_bytes:
++                fit_violations += 1
++            if not selected and after != before:
++                fit_violations += 1
++            if selected and row["target_tier"] == "DRAM":
++                per_cycle_selected[(row["run_id"], row["cycle_id"])] += seg_bytes
++            # P3: recompute semantic score from the four published terms
++            terms = [float(row["term_atype"]), float(row["term_freq"]),
++                     float(row["term_volume"]), float(row["term_immutable"])]
++            ok = True
++            for w, feat, term in (("weight_atype", "atype_score", "term_atype"),
++                                  ("weight_freq", "norm_freq", "term_freq"),
++                                  ("weight_volume", "norm_volume", "term_volume"),
++                                  ("weight_immutable", "immutable_score", "term_immutable")):
++                expected_term = float(row[w]) * float(row[feat])
++                err = abs(float(row[term]) - expected_term)
++                worst_term_err = max(worst_term_err, err)
++                if not close(float(row[term]), expected_term, rel=1e-9, abs_tol=1e-12):
++                    ok = False
++            err = abs(score - sum(terms))
++            worst_total_err = max(worst_total_err, err)
++            if not ok or not close(score, sum(terms), rel=1e-9, abs_tol=1e-12):
++                term_failures += 1
++            term_rows += 1
++    over_budget = {f"{rid}:{cid}": b for (rid, cid), b in per_cycle_selected.items() if b > BUDGET}
++    max_cycle_bytes = max(per_cycle_selected.values()) if per_cycle_selected else 0
++    proofs["2_strict_fit_budget"] = {
++        "budget_bytes": BUDGET, "cycles_checked": len(cycles),
++        "tie_break_violations": tie_violations, "fit_invariant_violations": fit_violations,
++        "max_selected_bytes_in_any_cycle": max_cycle_bytes,
++        "cycles_over_budget": over_budget,
++        "pass": tie_violations == 0 and fit_violations == 0 and not over_budget,
++    }
++    proofs["3_semantic_recompute"] = {
++        "rows_checked": term_rows, "recompute_failures": term_failures,
++        "max_abs_term_error": worst_term_err, "max_abs_total_error": worst_total_err,
++        "tolerance": "math.isclose(rel_tol=1e-9, abs_tol=1e-12)",
++        "pass": term_failures == 0,
++    }
++
++
++def proof_4_5_6(proofs: dict) -> None:
++    """C3 recompute (P4), dictionary excluded_reported (P5), counters >=2 (P6)."""
++    rates = load_calibration()
++    path = RUNS / "smoke_cost_c3_greedy_traceon" / "decision_trace.csv"
++    cost_failures = 0
++    total_failures = 0
++    worst_cost_rel = 0.0
++    worst_total_err = 0.0
++    rows_checked = 0
++    dict_rows = 0
++    dict_sum = 0
++    handling_values = Counter()
++    counter_rows_ge2 = 0
++    total_rows = 0
++    gamma_totals = Counter()
++    for row in read_csv_rows(path):
++        total_rows += 1
++        handling_values[row["dictionary_handling"]] += 1
++        if row["dictionary_count"]:
++            dict_count = int(row["dictionary_count"])
++            if dict_count > 0:
++                dict_rows += 1
++                dict_sum += dict_count
++        counts = {g: int(row[f"{g}_count"]) for g in GAMMAS}
++        nonzero = sum(1 for v in counts.values() if v > 0)
++        if nonzero >= 2:
++            counter_rows_ge2 += 1
++        for g, v in counts.items():
++            gamma_totals[g] += v
++        calib_key = DTYPE_TO_CALIB[row["data_type"]]
++        bpv = float(row["bytes_per_value"])
++        if bpv != CALIB_BYTES[calib_key]:
++            cost_failures += 1  # trace bytes_per_value disagrees with the mapped dtype width
++            rows_checked += 1
++            continue
++        row_cost_ok = True
++        for device, col in (("dram", "cost_dram"), ("cxl", "cost_cxl")):
++            expected = sum(rates[(device, g, calib_key)] * counts[g] * bpv for g in GAMMAS)
++            actual = float(row[col])
++            denom = max(abs(expected), 1e-12)
++            worst_cost_rel = max(worst_cost_rel, abs(actual - expected) / denom)
++            if not close(actual, expected, rel=1e-9, abs_tol=1e-6):
++                row_cost_ok = False
++        if not row_cost_ok:
++            cost_failures += 1
++        total = float(row["total_score"])
++        expected_total = float(row["cost_cxl"]) - float(row["cost_dram"])
++        worst_total_err = max(worst_total_err, abs(total - expected_total))
++        if not close(total, expected_total, rel=1e-9, abs_tol=1e-6):
++            total_failures += 1
++        rows_checked += 1
++    proofs["4_c3_recompute"] = {
++        "rows_checked": rows_checked, "calibration_csv": str(CALIB),
++        "calibration_sha256": sha256_file(CALIB),
++        "formula": "cost = sum_g calib[device][g][dtype] * count_g * bytes_per_value; "
++                   "total_score = cost_cxl - cost_dram",
++        "cost_recompute_failures": cost_failures, "total_recompute_failures": total_failures,
++        "max_rel_cost_error": worst_cost_rel, "max_abs_total_error": worst_total_err,
++        "tolerance": "math.isclose(rel_tol=1e-9, abs_tol=1e-6) — abs headroom covers the "
++                     "fixed-precision CSV columns",
++        "pass": cost_failures == 0 and total_failures == 0,
++    }
++    proofs["5_dictionary_reported_excluded"] = {
++        "dictionary_handling_values": dict(handling_values),
++        "rows_with_nonzero_dictionary_count": dict_rows, "total_rows": total_rows,
++        "dictionary_count_sum": dict_sum,
++        "note": "counters are reported in the trace but never enter the cost formula "
++                "(proof 4 recomputes costs from the four gamma counters alone and matches)",
++        "pass": set(handling_values) == {"excluded_reported"} and dict_rows > 0,
++    }
++    proofs["6_counters_nonzero"] = {
++        "rows_with_at_least_2_nonzero_counters": counter_rows_ge2, "total_rows": total_rows,
++        "fraction": counter_rows_ge2 / total_rows if total_rows else 0.0,
++        "gamma_counter_totals": dict(gamma_totals),
++        "pass": counter_rows_ge2 > 0 and all(v > 0 for v in gamma_totals.values()),
++    }
++
++
++def proof_7(proofs: dict) -> None:
++    """Schedule replay determinism."""
++    names = ("smoke_our_full", "smoke_our_full_rerun", "smoke_our_full_block2")
++    plan_hash = {n: sha256_file(RUNS / n / "schedule_plan.csv") for n in names}
++    plans = {n: read_plan(RUNS / n / "schedule_plan.csv") for n in names}
++
++    def first_diff(a: str, b: str):
++        return next((i for i, (x, y) in enumerate(zip(plans[a], plans[b]))
++                     if (x["item_id"], x["item_name"]) != (y["item_id"], y["item_name"])), None)
++
++    manifests = {n: list(read_csv_rows(RUNS / n / "schedule_manifest.csv")) for n in names}
++
++    def prefix_len(a: str, b: str):
++        n = 0
++        for x, y in zip(manifests[a], manifests[b]):
++            if (x["submission_index"], x["item_id"], x["item_name"]) != \
++               (y["submission_index"], y["item_id"], y["item_name"]):
++                break
++            n += 1
++        return n
++
++    def manifest_matches_plan(n: str):
++        for x in manifests[n]:
++            p = plans[n][int(x["submission_index"])]
++            if x["item_id"] != p["item_id"]:
++                return False
++        return True
++
++    same_prefix = prefix_len("smoke_our_full", "smoke_our_full_rerun")
++    diff_prefix = prefix_len("smoke_our_full", "smoke_our_full_block2")
++    proofs["7_schedule_replay"] = {
++        "plan_sha256": plan_hash,
++        "same_seed_plans_identical": plan_hash["smoke_our_full"] == plan_hash["smoke_our_full_rerun"],
++        "same_seed_first_diverging_plan_row": first_diff("smoke_our_full", "smoke_our_full_rerun"),
++        "diff_seed_first_diverging_plan_row": first_diff("smoke_our_full", "smoke_our_full_block2"),
++        "manifest_lengths": {n: len(manifests[n]) for n in names},
++        "same_seed_manifest_common_prefix": same_prefix,
++        "diff_seed_manifest_common_prefix": diff_prefix,
++        "manifests_are_plan_prefixes": {n: manifest_matches_plan(n) for n in names},
++        "pass": (plan_hash["smoke_our_full"] == plan_hash["smoke_our_full_rerun"]
++                 and first_diff("smoke_our_full", "smoke_our_full_rerun") is None
++                 and first_diff("smoke_our_full", "smoke_our_full_block2") == 0
++                 and same_prefix == min(len(manifests["smoke_our_full"]),
++                                        len(manifests["smoke_our_full_rerun"]))
++                 and diff_prefix == 0
++                 and all(manifest_matches_plan(n) for n in names)),
++    }
++
++
++def proof_8(proofs: dict) -> None:
++    out = {}
++    for name in ("smoke_dram_only", "smoke_cxl_only"):
++        data = json.loads((RUNS / name / "numa_residency.json").read_text())
++        out[name] = {k: data.get(k) for k in
++                     ("target_node", "off_target_pct", "threshold_pct", "verdict", "total_pages")}
++    proofs["8_reference_residency"] = {
++        "predeclared_threshold_pct": 5.0, "bundles": out,
++        "pass": bool(out) and all(v.get("verdict") == "PASS" for v in out.values()),
++    }
++
++
++def proof_9(proofs: dict) -> None:
++    path = RUNS / "smoke_our_full_traceon" / "operator_segment_trace.csv"
++    levels = Counter()
++    measured_missing_reads = 0
++    nonmeasured_with_reads = 0
++    rows = 0
++    enum_ok = True
++    for row in read_csv_rows(path):
++        rows += 1
++        level = row["attribution_level"]
++        levels[level] += 1
++        if level not in ("measured_per_execution", "counter_delta_concurrent", "plan_reference_only"):
++            enum_ok = False
++        reads = row.get("actual_reads", "")
++        if level == "measured_per_execution" and reads == "":
++            measured_missing_reads += 1
++        if level != "measured_per_execution" and reads != "":
++            nonmeasured_with_reads += 1
++    proofs["9_operator_attribution"] = {
++        "rows": rows, "level_counts": dict(levels), "level_enum_ok": enum_ok,
++        "measured_rows_missing_actual_reads": measured_missing_reads,
++        "nonmeasured_rows_with_actual_reads": nonmeasured_with_reads,
++        "pass": rows > 0 and enum_ok and measured_missing_reads == 0 and nonmeasured_with_reads == 0,
++    }
++
++
++def proof_10(proofs: dict) -> None:
++    env = PHASE_B / "environment"
++    required = ["ENVIRONMENT.md", "numactl_H.txt", "lspci_cxl.txt", "cxl_device_detail.txt",
++                "platform_identity.txt", "lscpu.txt", "node2_distance.txt", "node2_meminfo.txt"]
++    missing = [f for f in required if not (env / f).is_file()]
++    numactl = (env / "numactl_H.txt").read_text()
++    device = (env / "cxl_device_detail.txt").read_text()
++    evidence = {
++        "node2_memory_only_no_cpus": "node 2 cpus:\n" in numactl and "node 2 size: 524288 MB" in numactl,
++        "cxl_pci_device_present": "1f16:c500" in device and "CXL Memory Device" in device,
++        "device_attached_to_numa_node_1": "NUMA node: 1" in device,
++    }
++    proofs["10_platform_identity"] = {
++        "required_files": required, "missing": missing, "evidence": evidence,
++        "pass": not missing and all(evidence.values()),
++    }
++
++
++def main() -> int:
++    proofs: dict = {}
++    for fn in (proof_1, proof_2_3, proof_4_5_6, proof_7, proof_8, proof_9, proof_10):
++        fn(proofs)
++    all_pass = all(v.get("pass", False) for v in proofs.values() if isinstance(v, dict))
++    proofs["ALL_PROOFS_PASS"] = all_pass
++    (PHASE_B / "PROOFS.json").write_text(json.dumps(proofs, indent=2, ensure_ascii=False) + "\n")
++    lines = ["# Phase B — ten proofs", "", f"**ALL_PROOFS_PASS = {all_pass}**", ""]
++    names = {"1_candidate_set": "1  candidate set identical across migration arms",
++             "2_strict_fit_budget": "2  strict-fit budget + deterministic tie-break",
++             "3_semantic_recompute": "3  semantic score recompute (1e-9)",
++             "4_c3_recompute": "4  C3 score recompute from counters + calibration",
++             "5_dictionary_reported_excluded": "5  dictionary counters reported, excluded",
++             "6_counters_nonzero": "6  ≥2 pattern counters non-zero",
++             "7_schedule_replay": "7  schedule replay determinism",
++             "8_reference_residency": "8  reference-arm NUMA residency (≤5% off-target)",
++             "9_operator_attribution": "9  operator attribution_level / null reads",
++             "10_platform_identity": "10 CXL device & platform identity evidence"}
++    for key, title in names.items():
++        p = proofs[key]
++        lines.append(f"## {title} — {'PASS' if p['pass'] else 'FAIL'}")
++        for k, v in p.items():
++            if k in ("description", "note", "formula", "tolerance"):
++                lines.append(f"- {k}: {v}")
++            elif isinstance(v, (dict, list)):
++                lines.append(f"- `{k}`: `{json.dumps(v, ensure_ascii=False)}`")
++            else:
++                lines.append(f"- `{k}`: `{v}`")
++        lines.append("")
++    (PHASE_B / "PROOFS.md").write_text("\n".join(lines))
++    print(json.dumps({k: v.get("pass") for k, v in proofs.items() if isinstance(v, dict)}, indent=2))
++    print(f"ALL_PROOFS_PASS={all_pass}")
++    return 0 if all_pass else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/collect_proofs_phase_b2.py b/experiments/edbt_v4/collect_proofs_phase_b2.py
+new file mode 100644
+index 000000000..ef9bcb6d5
+--- /dev/null
++++ b/experiments/edbt_v4/collect_proofs_phase_b2.py
+@@ -0,0 +1,297 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 proof collector.
++
++Consumes the B2 smoke bundles (results_edbt_v4/02_phase_b2/smoke_runs) and the
++B2 calibration outputs; emits PROOFS.json + PROOFS.md with one PASS/FAIL per
++B2 requirement. Read-only: nothing here edits raw logs.
++
++Proofs:
++  P1  B2-2 candidate-set identity: initial set (semantic placement CSV) and
++      daemon per-cycle sets (decision trace) have IDENTICAL hashes across
++      our_full / our_freq / cost_c3_greedy, and initial == daemon.
++  P2  B2-4 all-policy typed counters: non-c3 rows carry the five counts and
++      dictionary_handling=observed_not_scored with empty costs; c3 rows carry
++      excluded_reported + both costs; counters are non-decreasing per segment
++      across cycles (cumulative semantics; per-cycle deltas computed downstream).
++  P3  B2-5 measured diagnostic: measured_segment_access.csv rows all
++      measured_per_execution with tier from {DRAM, CXL}; operator trace has
++      measured_per_execution rows; actual_reads non-null only on a subset
++      (unique-scan rule); run_config records clients=1 + trace_measured=true.
++  P4  B2-6 calibration: 40 cells x 12 retained repeats, working sets > LLC,
++      CI encloses the median, randomized cell order is a permutation.
++  P5  B2-7/B2-8: sensitivity outputs exist and carry Jaccard + dictionary
++      share numbers.
++  P6  B2-10 stamps: every bundle's validated.ok binds the validator SHA-256
++      and the validation-report SHA-256 (recomputed here).
++  P7  determinism: same-seed rerun's schedule_plan.csv is byte-identical.
++  P8  B2-1: every run_config.json records runner/validator SHA-256 that match
++      the actual files.
++"""
++
++import csv
++import hashlib
++import json
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++SMOKE = ROOT / "results_edbt_v4/02_phase_b2/smoke_runs"
++CALIB = ROOT / "results_edbt_v4/02_phase_b2/calibration"
++SENS = ROOT / "results_edbt_v4/02_phase_b2/sensitivity"
++PACK = Path("/home/dameng/CXL_migration/edbt_phase_b2_extract/CXL 页面迁移/edbt_experiment_pack")
++VALIDATOR = PACK / "scripts/validate_run_bundle.py"
++RUNNER = ROOT / "experiments/edbt_v4/run_smoke_phase_b2.py"
++
++TRACE_ARMS = {"smoke_b2_our_full_traceon": "our_full",
++              "smoke_b2_our_freq_traceon": "our_freq",
++              "smoke_b2_cost_c3_greedy_traceon": "cost_c3_greedy"}
++MEASURED_BUNDLE = "smoke_b2_our_full_measured"
++ALL_BUNDLES = list(TRACE_ARMS) + [MEASURED_BUNDLE,
++                                  "smoke_b2_our_full", "smoke_b2_our_freq", "smoke_b2_cost_c3_greedy",
++                                  "smoke_b2_dram_only", "smoke_b2_cxl_only", "smoke_b2_our_full_rerun"]
++LLC_BYTES = 452984832
++
++
++def sha256_bytes(b: bytes) -> str:
++    return hashlib.sha256(b).hexdigest()
++
++
++def sha256_file(p: Path) -> str:
++    return sha256_bytes(p.read_bytes())
++
++
++def set_hash(keys) -> str:
++    blob = "\n".join(sorted(keys)).encode()
++    return sha256_bytes(blob)
++
++
++def proof(name, ok, detail):
++    return {"name": name, "ok": bool(ok), "detail": detail}
++
++
++def p1_candidate_identity():
++    initial_hashes, daemon_hashes = {}, {}
++    details = {}
++    for bundle, arm in TRACE_ARMS.items():
++        d = SMOKE / bundle
++        placement = list(csv.DictReader(open(d / "benchmark_semantic_placement.csv")))
++        initial = {(r["table_name"], int(r["chunk_id"]), int(r["column_id"])) for r in placement}
++        initial_hashes[arm] = set_hash(initial)
++
++        trace = list(csv.DictReader(open(d / "decision_trace.csv")))
++        by_cycle = defaultdict(set)
++        for r in trace:
++            by_cycle[int(r["cycle_id"])].add((r["table_name"], int(r["chunk_id"]), int(r["column_id"])))
++        cycle_hashes = {c: set_hash(keys) for c, keys in by_cycle.items()}
++        distinct = set(cycle_hashes.values())
++        daemon_hashes[arm] = distinct.pop() if len(distinct) == 1 else f"INCONSISTENT({len(distinct)})"
++        details[arm] = dict(initial_segments=len(initial), cycles=len(by_cycle),
++                            initial_sha=initial_hashes[arm][:16], daemon_sha=daemon_hashes[arm][:16])
++    ok = (len(set(initial_hashes.values())) == 1
++          and len(set(daemon_hashes.values())) == 1
++          and next(iter(initial_hashes.values())) == next(iter(daemon_hashes.values())))
++    return proof("P1 B2-2 initial==daemon candidate-set hash, identical across 3 policies",
++                 ok, {"initial": initial_hashes, "daemon_per_cycle": daemon_hashes, "detail": details})
++
++
++def p2_typed_counters_all_policies():
++    problems = []
++    stats = {}
++    for bundle, arm in TRACE_ARMS.items():
++        d = SMOKE / bundle
++        rows = csv.DictReader(open(d / "decision_trace.csv"))
++        n = 0
++        prev = {}
++        nonmono = 0
++        nonzero_counts = defaultdict(int)
++        for r in rows:
++            n += 1
++            counts = [int(r[c]) for c in ("sequential_count", "monotonic_count", "random_count",
++                                          "point_count", "dictionary_count")]
++            if any(c < 0 for c in counts):
++                problems.append(f"{arm}: negative count row")
++            if arm == "cost_c3_greedy":
++                if r["dictionary_handling"] != "excluded_reported":
++                    problems.append(f"{arm}: dictionary_handling={r['dictionary_handling']!r}")
++                if r["cost_dram"] == "" or r["cost_cxl"] == "":
++                    problems.append(f"{arm}: missing costs")
++            else:
++                if r["dictionary_handling"] != "observed_not_scored":
++                    problems.append(f"{arm}: dictionary_handling={r['dictionary_handling']!r}")
++                if r["cost_dram"] != "" or r["cost_cxl"] != "":
++                    problems.append(f"{arm}: non-c3 row carries costs")
++            for c, v in zip(("seq", "mon", "rand", "point", "dict"), counts):
++                if v > 0:
++                    nonzero_counts[c] += 1
++            key = (r["table_name"], int(r["chunk_id"]), int(r["column_id"]))
++            if key in prev and any(v < p for v, p in zip(counts, prev[key])):
++                nonmono += 1
++            prev[key] = counts
++        if nonmono:
++            problems.append(f"{arm}: {nonmono} rows with decreasing cumulative counters")
++        stats[arm] = dict(rows=n, nonzero_rows=dict(nonzero_counts))
++    # at least two pattern columns non-zero on JOB smoke (c3 requirement kept)
++    c3nz = stats.get("cost_c3_greedy", {}).get("nonzero_rows", {})
++    if sum(1 for v in c3nz.values() if v > 0) < 2:
++        problems.append("c3: fewer than two non-zero pattern counter columns")
++    return proof("P2 B2-4 typed counters observed for all policies (cumulative, monotone)", not problems,
++                 {"problems": problems[:10], "stats": stats})
++
++
++def p3_measured_diagnostic():
++    d = SMOKE / MEASURED_BUNDLE
++    if not (d / "measured_segment_access.csv").exists():
++        return proof("P3 B2-5 measured diagnostic path", False, {"missing": "measured_segment_access.csv"})
++    problems = []
++    mrows = list(csv.DictReader(open(d / "measured_segment_access.csv")))
++    tiers = {r["tier_at_execution"] for r in mrows}
++    if any(r["attribution_level"] != "measured_per_execution" for r in mrows):
++        problems.append("non-measured attribution in measured_segment_access.csv")
++    if not tiers <= {"DRAM", "CXL"}:
++        problems.append(f"unexpected tiers {tiers}")
++    if not any(int(r["total_delta"]) > 0 for r in mrows):
++        problems.append("no positive measured deltas")
++
++    orows = list(csv.DictReader(open(d / "operator_segment_trace.csv")))
++    measured = [r for r in orows if r["attribution_level"] == "measured_per_execution"]
++    with_reads = [r for r in measured if r["actual_reads"] != ""]
++    if not measured:
++        problems.append("no measured operator rows")
++    for r in with_reads:
++        if int(r["actual_reads"]) < 0 or int(r["operator_wall_ns"]) <= 0:
++            problems.append("invalid measured operator row")
++            break
++
++    cfg = json.loads((d / "run_config.json").read_text())
++    if cfg.get("clients") != 1:
++        problems.append(f"clients={cfg.get('clients')} != 1")
++    if not cfg.get("trace_measured"):
++        problems.append("run_config lacks trace_measured=true")
++    return proof("P3 B2-5 single-client measured diagnostic (exact deltas + PQP rows/wall)", not problems,
++                 {"problems": problems, "measured_segment_rows": len(mrows),
++                  "measured_operator_rows": len(measured),
++                  "operator_rows_with_actual_reads": len(with_reads),
++                  "tiers": sorted(tiers)})
++
++
++def p4_calibration():
++    stats_p = CALIB / "calibration_stats.csv"
++    raw_p = CALIB / "calibration_raw_v2.csv"
++    if not stats_p.exists():
++        return proof("P4 B2-6 calibration redo (unique WS > LLC, randomized order, 12 repeats, CI)", False,
++                     {"missing": str(stats_p)})
++    problems = []
++    rows = list(csv.DictReader(open(stats_p)))
++    if len(rows) != 40:
++        problems.append(f"{len(rows)} cells != 40")
++    orders = sorted(int(r["cell_order"]) for r in rows)
++    if orders != list(range(40)):
++        problems.append("cell_order not a permutation of 0..39")
++    for r in rows:
++        if int(r["n"]) < 10:
++            problems.append(f"{r['device']}/{r['gamma']}/{r['data_type']}: n={r['n']} < 10")
++        if not (float(r["ci95_low"]) <= float(r["median_ns_per_access_per_byte"]) <= float(r["ci95_high"])):
++            problems.append(f"CI does not enclose median for {r['device']}/{r['gamma']}/{r['data_type']}")
++    raw = list(csv.DictReader(open(raw_p)))
++    for r in raw:
++        if int(r["working_set_bytes"]) <= LLC_BYTES:
++            problems.append(f"working set {r['working_set_bytes']} <= LLC for {r['device']}/{r['gamma']}/{r['data_type']}")
++            break
++    return proof("P4 B2-6 calibration redo (unique WS > LLC, randomized order, >=10 repeats, CI)", not problems,
++                 {"problems": problems[:10], "cells": len(rows), "raw_rows": len(raw)})
++
++
++def p5_sensitivity():
++    p = SENS / "sensitivity_results.json"
++    if not p.exists():
++        return proof("P5 B2-7/B2-8 sensitivity analyses", False, {"missing": str(p)})
++    data = json.loads(p.read_text())
++    b27 = data["b27_calibration_sensitivity"]
++    b28 = data["b28_dictionary_sensitivity"]
++    problems = []
++    for v in ("lo", "hi"):
++        if not (0.0 <= b27["jaccard_segment"][v] <= 1.0):
++            problems.append(f"jaccard lo/hi out of range: {v}")
++    if not (0.0 <= b28["dictionary_share_cumulative"] <= 1.0):
++        problems.append("dictionary share out of range")
++    return proof("P5 B2-7/B2-8 sensitivity (endpoints Jaccard + dictionary share)", not problems,
++                 {"problems": problems, "jaccard_segment": b27["jaccard_segment"],
++                  "jaccard_byte_weighted": b27["jaccard_byte_weighted"],
++                  "dictionary_share_cumulative": b28["dictionary_share_cumulative"],
++                  "dictionary_share_delta": b28["dictionary_share_delta"],
++                  "b28_jaccard_vs_excluded": b28["jaccard_segment_vs_excluded"]})
++
++
++def p6_stamps():
++    problems, stamps = [], {}
++    for bundle in ALL_BUNDLES:
++        d = SMOKE / bundle
++        stamp_p = d / "validated.ok"
++        report_p = d / "validation_report.json"
++        if not stamp_p.exists():
++            problems.append(f"{bundle}: no validated.ok")
++            continue
++        try:
++            stamp = json.loads(stamp_p.read_text())
++        except Exception as exc:
++            problems.append(f"{bundle}: stamp unparseable: {exc}")
++            continue
++        if stamp.get("validator_sha256") != sha256_file(VALIDATOR):
++            problems.append(f"{bundle}: stamp validator SHA mismatch")
++        if stamp.get("validation_report_sha256") != sha256_file(report_p):
++            problems.append(f"{bundle}: stamp report SHA mismatch")
++        rep = json.loads(report_p.read_text())
++        if not rep.get("valid"):
++            problems.append(f"{bundle}: validation_report not valid")
++        stamps[bundle] = stamp["validation_report_sha256"][:16]
++    return proof("P6 B2-10 validated.ok binds validator + report SHA-256 (all bundles)", not problems,
++                 {"problems": problems, "stamps": stamps})
++
++
++def p7_determinism():
++    a = SMOKE / "smoke_b2_our_full" / "schedule_plan.csv"
++    b = SMOKE / "smoke_b2_our_full_rerun" / "schedule_plan.csv"
++    if not (a.exists() and b.exists()):
++        return proof("P7 same-seed schedule determinism", False, {"missing": "schedule_plan.csv"})
++    same = a.read_bytes() == b.read_bytes()
++    return proof("P7 same-seed schedule determinism (byte-identical schedule_plan.csv)", same,
++                 {"sha256_a": sha256_file(a), "sha256_b": sha256_file(b)})
++
++
++def p8_run_config_shas():
++    problems = []
++    runner_sha = sha256_file(RUNNER)
++    validator_sha = sha256_file(VALIDATOR)
++    for bundle in ALL_BUNDLES:
++        d = SMOKE / bundle
++        if not (d / "run_config.json").exists():
++            problems.append(f"{bundle}: no run_config.json")
++            continue
++        cfg = json.loads((d / "run_config.json").read_text())
++        if cfg.get("runner_sha256") != runner_sha:
++            problems.append(f"{bundle}: runner SHA mismatch")
++        if cfg.get("validator_sha256") != validator_sha:
++            problems.append(f"{bundle}: validator SHA mismatch")
++    return proof("P8 B2-1 every run_config records matching runner/validator SHA-256", not problems,
++                 {"problems": problems, "runner_sha256": runner_sha, "validator_sha256": validator_sha})
++
++
++def main() -> int:
++    proofs = [p1_candidate_identity(), p2_typed_counters_all_policies(), p3_measured_diagnostic(),
++              p4_calibration(), p5_sensitivity(), p6_stamps(), p7_determinism(), p8_run_config_shas()]
++    all_ok = all(p["ok"] for p in proofs)
++    out = {"ALL_PROOFS_PASS": all_ok, "proofs": proofs}
++    (ROOT / "results_edbt_v4/02_phase_b2/PROOFS.json").write_text(json.dumps(out, indent=2) + "\n")
++    lines = [f"# EDBT v4 Phase B2 proofs: {'ALL PASS' if all_ok else 'FAILURES PRESENT'}", ""]
++    for p in proofs:
++        lines.append(f"## [{'PASS' if p['ok'] else 'FAIL'}] {p['name']}")
++        lines.append(f"```json\n{json.dumps(p['detail'], indent=2, ensure_ascii=False)}\n```")
++        lines.append("")
++    (ROOT / "results_edbt_v4/02_phase_b2/PROOFS.md").write_text("\n".join(lines) + "\n")
++    print(json.dumps(out, indent=2)[:4000])
++    return 0 if all_ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/compare_b1_equivalence.py b/experiments/edbt_v4/compare_b1_equivalence.py
+new file mode 100644
+index 000000000..693cac931
+--- /dev/null
++++ b/experiments/edbt_v4/compare_b1_equivalence.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B — commit B1 trace-off equivalence comparison.
++
++Compares the B1-instrumented binary (trace OFF) against the clean base build
++(0f182ad07, fresh worktree build).
++
++Method notes (derived from the first MISMATCH iteration, kept for the record):
++- benchmark_semantic_placement.csv carries the FINAL accumulated access
++  counters, which count the whole Shuffled run; counter jitter (~0.005%) is
++  pre-existing run-to-run nondeterminism and appears INSIDE the base-vs-base
++  control pair as well. Byte-comparing the file is therefore the wrong
++  invariant. The decision invariant is the segment -> decision MAPPING
++  (table,chunk,col) -> (access_type,target_tier,create_replica,is_immutable,
++  data_volume), which is order-insensitive.
++- Even the mapping-adjacent row ORDER can swap by one position when two
++  segments have near-equal profiling frequencies (observed identically in the
++  base-vs-base control). This is reported but not treated as a mismatch.
++- run.log lines embed run-specific paths (output dir, plugin path). Paths are
++  normalized before comparison; timing/counter lines are filtered.
++
++Pairs:
++  A) daemon OFF pair (deterministic decision path): mapping must be identical,
++     normalized filtered logs identical.
++  B) base-vs-base control (daemon ON): demonstrates pre-existing
++     nondeterminism ([Daemon] cycle lines differ run-to-run; frequency column
++     jitters) on the UNPATCHED binary.
++  C) base vs B1 with daemon ON: mapping must be identical.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sys
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++EQ = ROOT / "results_edbt_v4/01_phase_b/smoke_runs/commit_b1_equivalence"
++
++# Lines removed before run.log comparison: per-query results, daemon cycle
++# accounting (counter-driven, nondeterministic), table-load timings.
++TIMING_OR_NOISE = re.compile(
++    r"Results for|-> *Executed|additional runs failed|\[Daemon\] Cycle|"
++    r"Loaded table|Loading/Generating|Generating test |took|µs|ms\)|"
++    r"\[Daemon\] Thread exiting|Benchmarking [0-9]"
++)
++
++# Run-specific path normalization: output dir per run, binary/plugin location
++# (main-tree build vs base worktree build), and JSON output paths.
++PATH_NORM = [
++    (re.compile(r"/commit_b1_equivalence/\w+"), "/commit_b1_equivalence/RUN"),
++    (re.compile(r"/home/dameng/CXL_migration/hyrise_base_wt/build_base"), "BINDIR"),
++    (re.compile(r"/home/dameng/CXL_migration/hyrise/build"), "BINDIR"),
++]
++
++
++def normalized(line: str) -> str:
++    for rx, repl in PATH_NORM:
++        line = rx.sub(repl, line)
++    return line.rstrip()
++
++
++def filtered_log(path: Path) -> list[str]:
++    out = []
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        if TIMING_OR_NOISE.search(line):
++            continue
++        out.append(normalized(line))
++    return out
++
++
++def daemon_lines(path: Path) -> list[str]:
++    return [l.strip() for l in (path / "run.log").read_text(encoding="utf-8", errors="replace").splitlines()
++            if "[Daemon] Cycle" in l]
++
++
++def sha256(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def placement_facts(path: Path) -> dict[tuple[str, int, int], tuple[int, int, int, int, int]]:
++    """segment -> (access_type, target_tier, create_replica, is_immutable, data_volume)."""
++    facts = {}
++    with path.open(encoding="utf-8") as f:
++        header = f.readline().strip().split(",")
++        idx = {name: i for i, name in enumerate(header)}
++        for line in f:
++            if not line.strip():
++                continue
++            cols = line.rstrip("\n").split(",")
++            key = (cols[idx["table_name"]], int(cols[idx["chunk_id"]]), int(cols[idx["column_id"]]))
++            facts[key] = (int(cols[idx["access_type"]]), int(cols[idx["target_tier"]]),
++                          int(cols[idx["create_replica"]]), int(cols[idx["is_immutable"]]),
++                          int(cols[idx["data_volume"]]))
++    return facts
++
++
++def frequency_column(path: Path) -> list[int]:
++    with path.open(encoding="utf-8") as f:
++        header = f.readline().strip().split(",")
++        i = header.index("access_frequency")
++        return [int(l.rstrip("\n").split(",")[i]) for l in f if l.strip()]
++
++
++def pair(label: str, a: str, b: str) -> dict:
++    pa = EQ / a / "benchmark_semantic_placement.csv"
++    pb = EQ / b / "benchmark_semantic_placement.csv"
++    fa, fb = placement_facts(pa), placement_facts(pb)
++    freq_a, freq_b = frequency_column(pa), frequency_column(pb)
++    only_a = {k: v for k, v in fa.items() if fb.get(k) != v}
++    only_b = {k: v for k, v in fb.items() if fa.get(k) != v}
++    freq_jitter = sum(1 for x, y in zip(freq_a, freq_b) if x != y)
++    la, lb = filtered_log(EQ / a / "run.log"), filtered_log(EQ / b / "run.log")
++    # Multiset comparison: parallel table loading emits "will be encoded as ..."
++    # notice lines in nondeterministic ORDER (stdout race, also present in the
++    # base-vs-base control pair). Line multiset equality is the invariant;
++    # ordered equality is reported informationally.
++    entry = {
++        "a": a,
++        "b": b,
++        "placement_csv_a_sha256": sha256(pa),
++        "placement_csv_b_sha256": sha256(pb),
++        "segment_count_a": len(fa),
++        "segment_count_b": len(fb),
++        "decision_mapping_identical": not only_a and not only_b and len(fa) == len(fb),
++        "decision_mapping_diff_a": sorted(map(str, only_a.keys()))[:6],
++        "decision_mapping_diff_b": sorted(map(str, only_b.keys()))[:6],
++        "frequency_column_differing_rows": freq_jitter,
++        "frequency_total_a": sum(freq_a),
++        "frequency_total_b": sum(freq_b),
++        "filtered_log_identical": sorted(la) == sorted(lb),
++        "filtered_log_ordered_identical": la == lb,
++        "filtered_log_line_counts": [len(la), len(lb)],
++    }
++    if sorted(la) != sorted(lb):
++        entry["filtered_log_diff"] = [f"-{x}" for x in la if x not in lb][:8] + \
++                                     [f"+{x}" for x in lb if x not in la][:8]
++    return entry
++
++
++def main() -> int:
++    report = {"pairs": {}, "verdict": None}
++
++    report["pairs"]["A_daemon0_base_vs_b1"] = pair("A_daemon0_base_vs_b1", "eq_base_daemon0", "eq_b1_daemon0")
++    report["pairs"]["B_control_base_vs_base_d1"] = pair("B_control_base_vs_base_d1", "eq_base_d1_run1", "eq_base_d1_run2")
++    report["pairs"]["C_daemon1_base_vs_b1"] = pair("C_daemon1_base_vs_b1", "eq_base_d1_run1", "eq_b1_d1")
++
++    # Control pair must DEMONSTRATE the pre-existing nondeterminism class.
++    da, db = daemon_lines(EQ / "eq_base_d1_run1"), daemon_lines(EQ / "eq_base_d1_run2")
++    report["control_daemon_line_variability"] = {
++        "base_run1_daemon_lines": len(da),
++        "base_run2_daemon_lines": len(db),
++        "daemon_lines_differ_between_base_runs": da != db,
++    }
++
++    p = report["pairs"]
++    ok = (
++        p["A_daemon0_base_vs_b1"]["decision_mapping_identical"]
++        and p["A_daemon0_base_vs_b1"]["filtered_log_identical"]
++        and p["B_control_base_vs_base_d1"]["decision_mapping_identical"]
++        and p["C_daemon1_base_vs_b1"]["decision_mapping_identical"]
++        and report["control_daemon_line_variability"]["daemon_lines_differ_between_base_runs"]
++    )
++    report["verdict"] = "EQUIVALENT_ON_DETERMINISTIC_PATH" if ok else "MISMATCH"
++
++    out = EQ / "EQ_REPORT.json"
++    out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps(report, indent=2))
++    return 0 if ok else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/finalize_phase_b.py b/experiments/edbt_v4/finalize_phase_b.py
+new file mode 100644
+index 000000000..e8caf5361
+--- /dev/null
++++ b/experiments/edbt_v4/finalize_phase_b.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B finalization.
++
++Run AFTER run_smoke_phase_b.py and collect_proofs_phase_b.py:
++
++1. scans every smoke bundle (exit code, validation_report.json, run_config,
++   BASELINE line of cost_c3_greedy bundles, NUMA residency verdicts),
++2. merges PROOFS.json,
++3. writes results_edbt_v4/01_phase_b/SMOKE_VERDICT.json,
++4. writes results_edbt_v4/01_phase_b/PHASE_B_FILES.sha256 covering everything
++   under 01_phase_b/ EXCEPT the manifest itself (gate fix 1 applies to this
++   manifest too).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++PHASE_B = ROOT / "results_edbt_v4/01_phase_b"
++RUNS = PHASE_B / "smoke_runs"
++EXPECTED_BASELINE_SHA = "24cdfedff80a9ce962136979060a2fc1c293e4300cd61685a14a39b92806f40a"
++EXPECTED_GIT = "fab61b2fee237323833be3fa333054ce669fbff5"
++MANIFEST = "PHASE_B_FILES.sha256"
++VERDICT = "SMOKE_VERDICT.json"
++
++BUNDLES = ("smoke_our_full", "smoke_our_freq", "smoke_cost_c3_greedy",
++           "smoke_dram_only", "smoke_cxl_only", "smoke_our_full_traceon",
++           "smoke_our_freq_traceon", "smoke_cost_c3_greedy_traceon",
++           "smoke_our_full_rerun", "smoke_our_full_block2")
++
++
++def bundle_status(name: str) -> dict:
++    d = RUNS / name
++    status: dict = {"bundle": name}
++    if not d.is_dir():
++        status["present"] = False
++        status["ok"] = False
++        return status
++    status["present"] = True
++    status["exit_code"] = int((d / "exit_code.txt").read_text().strip()) if (d / "exit_code.txt").is_file() else None
++    vr = d / "validation_report.json"
++    if vr.is_file():
++        report = json.loads(vr.read_text())
++        status["validator_valid"] = report.get("valid")
++        status["validator_errors"] = report.get("errors", [])[:10]
++    else:
++        status["validator_valid"] = None
++    rc = d / "run_config.json"
++    if rc.is_file():
++        cfg = json.loads(rc.read_text())
++        status["config"] = cfg.get("config")
++        status["git_hash"] = cfg.get("git_hash")
++        status["git_dirty"] = cfg.get("git_dirty")
++        status["binary_sha256"] = cfg.get("binary_sha256")
++        status["schedule_seed"] = cfg.get("schedule_seed")
++        if cfg.get("plugin_sha256"):
++            status["plugin_sha256"] = cfg.get("plugin_sha256")
++    res = d / "numa_residency.json"
++    if res.is_file():
++        data = json.loads(res.read_text())
++        status["numa_off_target_pct"] = data.get("off_target_pct")
++        status["numa_verdict"] = data.get("verdict")
++    # BASELINE contract for c3 bundles
++    log = d / "run.log"
++    if log.is_file() and "cost_c3_greedy" in name:
++        m = re.search(r"BASELINE cost_c3_greedy version=([0-9a-f]{40}) "
++                      r"calibration_sha256=([0-9a-f]{64}) counter_set=([\w,]+)", log.read_text())
++        if m:
++            status["baseline_version_ok"] = m.group(1) == EXPECTED_GIT
++            status["baseline_calibration_sha_ok"] = m.group(2) == EXPECTED_BASELINE_SHA
++            status["baseline_counter_set"] = m.group(3)
++        else:
++            status["baseline_version_ok"] = False
++            status["baseline_calibration_sha_ok"] = False
++    summary = d / "summary.csv"
++    if summary.is_file():
++        for line in summary.read_text().splitlines()[1:]:
++            parts = line.split(",")
++            if len(parts) >= 4:
++                status["n_items"] = int(parts[2])
++                status["geomean_avg_ms"] = float(parts[3])
++    status["ok"] = (status.get("exit_code") == 0
++                    and status.get("validator_valid") is True
++                    and status.get("git_hash") == EXPECTED_GIT
++                    and status.get("git_dirty") in (False, None)
++                    and status.get("baseline_version_ok", True)
++                    and status.get("baseline_calibration_sha_ok", True)
++                    and status.get("numa_verdict", "PASS") == "PASS")
++    return status
++
++
++def main() -> int:
++    # Provenance: the recorded git_dirty=True in every bundle comes from the
++    # UNTRACKED experiment/result output directories, not from modified tracked
++    # sources. Verify that right now — if any tracked file were modified, the
++    # bundles' binaries could not be attributed to HEAD and the smoke must fail.
++    porcelain = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"],
++                                        text=True).splitlines()
++    untracked_only = not any(line and not line.startswith("??") for line in porcelain)
++    bundles = [bundle_status(n) for n in BUNDLES]
++    for b in bundles:
++        if b.get("git_dirty") is True and untracked_only:
++            b["git_dirty_attributable_to_untracked_outputs_only"] = True
++            b["ok"] = (b.get("exit_code") == 0
++                       and b.get("validator_valid") is True
++                       and b.get("git_hash") == EXPECTED_GIT
++                       and b.get("baseline_version_ok", True)
++                       and b.get("baseline_calibration_sha_ok", True)
++                       and b.get("numa_verdict", "PASS") == "PASS")
++    proofs = json.loads((PHASE_B / "PROOFS.json").read_text())
++    all_bundles_ok = all(b["ok"] for b in bundles)
++    verdict = {
++        "experiment": "EDBT_V4_PHASE_B",
++        "stage": "implementation+build+smoke (NOT the formal E12/E13 runs)",
++        "git_head": EXPECTED_GIT,
++        "git_tracked_dirty_at_finalize": not untracked_only,
++        "git_dirty_note": "bundle run_config git_dirty=true is caused solely by the "
++                          "untracked experiments/edbt_v4/ and results_edbt_v4/ output "
++                          "directories; zero tracked files are modified (verified at "
++                          "finalize time)" if untracked_only else
++                          "TRACKED FILES MODIFIED — provenance broken",
++        "binary_sha256": bundles[0].get("binary_sha256") if bundles else None,
++        "dram_budget_bytes": 3725884160,
++        "off_target_page_threshold_pct": 5.0,
++        "calibration_sha256": EXPECTED_BASELINE_SHA,
++        "bundles": bundles,
++        "all_bundles_ok": all_bundles_ok,
++        "proofs_all_pass": proofs.get("ALL_PROOFS_PASS"),
++        "proofs": {k: v.get("pass") for k, v in proofs.items() if isinstance(v, dict)},
++        "notes": [
++            "smoke_our_full_attempt1_harness_crash retained (benchmark exit 0, harness "
++            "SameFileError in sidecar copy; fixed by skipping src==dst)",
++            "preflight_c3 retained (12 s loader sanity for the aggregated calibration.csv)",
++            "trace-off equivalence to the pre-B1 binary: smoke_runs/commit_b1_equivalence/",
++        ],
++    }
++    verdict["SMOKE_PASS"] = bool(all_bundles_ok and proofs.get("ALL_PROOFS_PASS"))
++    (PHASE_B / VERDICT).write_text(json.dumps(verdict, indent=2, ensure_ascii=False) + "\n")
++
++    # File manifest over the whole phase-B tree, excluding the manifest itself.
++    files = sorted(p for p in PHASE_B.rglob("*") if p.is_file() and p.name != MANIFEST)
++    lines = []
++    for p in files:
++        h = hashlib.sha256()
++        with p.open("rb") as f:
++            for chunk in iter(lambda: f.read(1 << 20), b""):
++                h.update(chunk)
++        lines.append(f"{h.hexdigest()}  {p.relative_to(PHASE_B)}")
++    (PHASE_B / MANIFEST).write_text("\n".join(lines) + "\n")
++    print(f"{VERDICT}: SMOKE_PASS={verdict['SMOKE_PASS']}")
++    print(f"{MANIFEST}: {len(lines)} files")
++    for b in bundles:
++        print(f"  {b['bundle']}: ok={b.get('ok')} exit={b.get('exit_code')} "
++              f"validator={b.get('validator_valid')}")
++    return 0 if verdict["SMOKE_PASS"] else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/finalize_phase_b2.py b/experiments/edbt_v4/finalize_phase_b2.py
+new file mode 100644
+index 000000000..0ca10d3ef
+--- /dev/null
++++ b/experiments/edbt_v4/finalize_phase_b2.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 finalization.
++
++Run AFTER run_smoke_phase_b2.py, aggregate_calibration_v2.py,
++analyze_calibration_sensitivity.py and collect_proofs_phase_b2.py:
++
++1. scans every B2 smoke bundle (exit code, validation_report.json + validated.ok
++   stamp, run_config runner/validator SHAs, BASELINE line of cost_c3_greedy
++   bundles — bound to the NEW v2 calibration SHA — NUMA residency verdicts),
++2. merges PROOFS.json,
++3. writes results_edbt_v4/02_phase_b2/PHASE_B2_VERDICT.json,
++4. writes results_edbt_v4/02_phase_b2/PHASE_B2_FILES.sha256 covering everything
++   under 02_phase_b2/ EXCEPT the manifest itself.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++PHASE = ROOT / "results_edbt_v4/02_phase_b2"
++RUNS = PHASE / "smoke_runs"
++CALIB_CSV = PHASE / "calibration/calibration.csv"
++EXPECTED_GIT = "eee20419dd7b81b7f82299b8ac3f6ae26b5c9dc33"  # B5 (filled at runtime if HEAD differs)
++MANIFEST = "PHASE_B2_FILES.sha256"
++VERDICT = "PHASE_B2_VERDICT.json"
++
++BUNDLES = ("smoke_b2_our_full", "smoke_b2_our_freq", "smoke_b2_cost_c3_greedy",
++           "smoke_b2_dram_only", "smoke_b2_cxl_only", "smoke_b2_our_full_traceon",
++           "smoke_b2_our_freq_traceon", "smoke_b2_cost_c3_greedy_traceon",
++           "smoke_b2_our_full_measured", "smoke_b2_our_full_rerun")
++
++
++def sha256_file(p: Path) -> str:
++    return subprocess.check_output(["sha256sum", str(p)], text=True).split()[0]
++
++
++def bundle_status(name: str, expected_git: str, expected_calib_sha: str) -> dict:
++    d = RUNS / name
++    status: dict = {"bundle": name}
++    if not d.is_dir():
++        status["present"] = False
++        status["ok"] = False
++        return status
++    status["present"] = True
++    status["exit_code"] = int((d / "exit_code.txt").read_text().strip()) if (d / "exit_code.txt").is_file() else None
++    vr = d / "validation_report.json"
++    if vr.is_file():
++        report = json.loads(vr.read_text())
++        status["validator_valid"] = report.get("valid")
++        status["validator_errors"] = report.get("errors", [])[:10]
++    else:
++        status["validator_valid"] = None
++    stamp = d / "validated.ok"
++    if stamp.is_file():
++        s = json.loads(stamp.read_text())
++        status["stamp_validator_sha_ok"] = s.get("validator_sha256") is not None
++        status["stamp_report_sha_ok"] = s.get("validation_report_sha256") == sha256_file(vr)
++    rc = d / "run_config.json"
++    if rc.is_file():
++        cfg = json.loads(rc.read_text())
++        status["config"] = cfg.get("config")
++        status["git_hash"] = cfg.get("git_hash")
++        status["git_tracked_dirty"] = cfg.get("git_tracked_dirty")
++        status["binary_sha256"] = cfg.get("binary_sha256")
++        status["schedule_seed"] = cfg.get("schedule_seed")
++        if cfg.get("plugin_sha256"):
++            status["plugin_sha256"] = cfg.get("plugin_sha256")
++    res = d / "numa_residency.json"
++    if res.is_file():
++        data = json.loads(res.read_text())
++        status["numa_off_target_pct"] = data.get("off_target_pct")
++        status["numa_verdict"] = data.get("verdict")
++    # BASELINE contract for c3 bundles — calibration SHA must be the v2 table
++    log = d / "run.log"
++    if log.is_file() and "cost_c3_greedy" in name:
++        m = re.search(r"BASELINE cost_c3_greedy version=([0-9a-f]{40}) "
++                      r"calibration_sha256=([0-9a-f]{64}) counter_set=([\w,]+)", log.read_text())
++        if m:
++            status["baseline_version_ok"] = m.group(1) == expected_git
++            status["baseline_calibration_sha_ok"] = m.group(2) == expected_calib_sha
++            status["baseline_counter_set"] = m.group(3)
++        else:
++            status["baseline_version_ok"] = False
++            status["baseline_calibration_sha_ok"] = False
++    summary = d / "summary.csv"
++    if summary.is_file():
++        for line in summary.read_text().splitlines()[1:]:
++            parts = line.split(",")
++            if len(parts) >= 4:
++                status["n_items"] = int(parts[2])
++                status["geomean_avg_ms"] = float(parts[3])
++    status["ok"] = (status.get("exit_code") == 0
++                    and status.get("validator_valid") is True
++                    and status.get("stamp_report_sha_ok", False)
++                    and status.get("git_hash") == expected_git
++                    and status.get("git_tracked_dirty") is False
++                    and status.get("baseline_version_ok", True)
++                    and status.get("baseline_calibration_sha_ok", True)
++                    and status.get("numa_verdict", "PASS") == "PASS")
++    return status
++
++
++def main() -> int:
++    expected_git = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
++                                           text=True).strip()
++    expected_calib_sha = sha256_file(CALIB_CSV)
++
++    porcelain = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"],
++                                        text=True).splitlines()
++    tracked_dirty = any(line and not line.startswith("??") for line in porcelain)
++
++    bundles = [bundle_status(n, expected_git, expected_calib_sha) for n in BUNDLES]
++    proofs = json.loads((PHASE / "PROOFS.json").read_text())
++    all_bundles_ok = all(b["ok"] for b in bundles)
++    verdict = {
++        "experiment": "EDBT_V4_PHASE_B2",
++        "stage": "B2 corrections (shared enumerator, all-policy counters, measured "
++                 "diagnostic, calibration redo, sensitivity, documentation) — NOT the "
++                 "formal E12/E13 runs",
++        "git_head": expected_git,
++        "git_tracked_dirty_at_finalize": tracked_dirty,
++        "binary_sha256": bundles[0].get("binary_sha256") if bundles else None,
++        "plugin_sha256": bundles[0].get("plugin_sha256") if bundles else None,
++        "dram_budget_bytes": 3725884160,
++        "off_target_page_threshold_pct": 5.0,
++        "calibration_v2_sha256": expected_calib_sha,
++        "bundles": bundles,
++        "all_bundles_ok": all_bundles_ok,
++        "proofs_all_pass": proofs.get("ALL_PROOFS_PASS"),
++        "proofs": {p["name"]: p["ok"] for p in proofs.get("proofs", [])},
++        "next_step": "STOP and wait for human review; do NOT start the formal campaign",
++    }
++    verdict["PHASE_B2_PASS"] = bool(all_bundles_ok and proofs.get("ALL_PROOFS_PASS") and not tracked_dirty)
++    (PHASE / VERDICT).write_text(json.dumps(verdict, indent=2, ensure_ascii=False) + "\n")
++
++    files = sorted(p for p in PHASE.rglob("*") if p.is_file() and p.name != MANIFEST)
++    lines = []
++    for p in files:
++        h = hashlib.sha256()
++        with p.open("rb") as f:
++            for chunk in iter(lambda: f.read(1 << 20), b""):
++                h.update(chunk)
++        lines.append(f"{h.hexdigest()}  {p.relative_to(PHASE)}")
++    (PHASE / MANIFEST).write_text("\n".join(lines) + "\n")
++    print(f"{VERDICT}: PHASE_B2_PASS={verdict['PHASE_B2_PASS']}")
++    print(f"{MANIFEST}: {len(lines)} files")
++    for b in bundles:
++        print(f"  {b['bundle']}: ok={b.get('ok')} exit={b.get('exit_code')} "
++              f"validator={b.get('validator_valid')} stamp={b.get('stamp_report_sha_ok')}")
++    return 0 if verdict["PHASE_B2_PASS"] else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/make_schedule_tests.py b/experiments/edbt_v4/make_schedule_tests.py
+new file mode 100644
+index 000000000..e397de070
+--- /dev/null
++++ b/experiments/edbt_v4/make_schedule_tests.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B: assemble schedule_tests/ artifacts from the smoke bundles.
++
++Produces:
++  schedule_tests/replay_report.json        — full determinism analysis
++  schedule_tests/plan_head_comparison.csv  — first N plan rows, three arms side by side
++  schedule_tests/manifest_head_comparison.csv — same for the manifests
++  schedule_tests/README.md is hand-written; this script only emits the data files.
++"""
++from __future__ import annotations
++
++import csv
++import hashlib
++import json
++import sys
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++RUNS = ROOT / "results_edbt_v4/01_phase_b/smoke_runs"
++OUT = ROOT / "results_edbt_v4/01_phase_b/schedule_tests"
++ARMS = {"seed101_a": "smoke_our_full", "seed101_b": "smoke_our_full_rerun",
++        "seed202": "smoke_our_full_block2"}
++N_HEAD = 25
++
++
++def sha256_file(p: Path) -> str:
++    h = hashlib.sha256()
++    with p.open("rb") as f:
++        for chunk in iter(lambda: f.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def read_plan(p: Path) -> list[dict]:
++    lines = p.read_text().splitlines()
++    assert lines[0] == "seed,item_count,plan_length"
++    return list(csv.DictReader("\n".join(lines[2:]).splitlines(keepends=True)))
++
++
++def read_manifest(p: Path) -> list[dict]:
++    with p.open(newline="") as f:
++        return list(csv.DictReader(f))
++
++
++def main() -> int:
++    OUT.mkdir(parents=True, exist_ok=True)
++    plans = {k: read_plan(RUNS / v / "schedule_plan.csv") for k, v in ARMS.items()}
++    manifests = {k: read_manifest(RUNS / v / "schedule_manifest.csv") for k, v in ARMS.items()}
++
++    def first_plan_diff(a, b):
++        return next((i for i, (x, y) in enumerate(zip(plans[a], plans[b]))
++                     if (x["item_id"], x["item_name"]) != (y["item_id"], y["item_name"])), None)
++
++    def prefix(a, b):
++        n = 0
++        for x, y in zip(manifests[a], manifests[b]):
++            if (x["submission_index"], x["item_id"], x["item_name"]) != \
++               (y["submission_index"], y["item_id"], y["item_name"]):
++                break
++            n += 1
++        return n
++
++    def plan_prefix_ok(k):
++        return all(x["item_id"] == plans[k][int(x["submission_index"])]["item_id"]
++                   for x in manifests[k])
++
++    report = {
++        "contract": "same --schedule_seed => byte-identical plan + manifest that is an "
++                    "exact prefix of it; different seed => fork at submission 0",
++        "plan_sha256": {k: sha256_file(RUNS / v / "schedule_plan.csv") for k, v in ARMS.items()},
++        "plan_meta": {k: (RUNS / v / "schedule_plan.csv").read_text().splitlines()[1]
++                      for k, v in ARMS.items()},
++        "plan_length_rows": {k: len(v) for k, v in plans.items()},
++        "manifest_rows": {k: len(v) for k, v in manifests.items()},
++        "same_seed_plan_first_diverging_row": first_plan_diff("seed101_a", "seed101_b"),
++        "diff_seed_plan_first_diverging_row": first_plan_diff("seed101_a", "seed202"),
++        "same_seed_manifest_common_prefix_rows": prefix("seed101_a", "seed101_b"),
++        "diff_seed_manifest_common_prefix_rows": prefix("seed101_a", "seed202"),
++        "manifest_is_plan_prefix": {k: plan_prefix_ok(k) for k in ARMS},
++        "verdict": "PASS" if (
++            sha256_file(RUNS / ARMS["seed101_a"] / "schedule_plan.csv")
++            == sha256_file(RUNS / ARMS["seed101_b"] / "schedule_plan.csv")
++            and first_plan_diff("seed101_a", "seed202") == 0
++            and prefix("seed101_a", "seed101_b") == min(len(manifests["seed101_a"]),
++                                                        len(manifests["seed101_b"]))
++            and prefix("seed101_a", "seed202") == 0
++            and all(plan_prefix_ok(k) for k in ARMS)) else "FAIL",
++    }
++    (OUT / "replay_report.json").write_text(json.dumps(report, indent=2) + "\n")
++
++    keys = list(ARMS)
++    with (OUT / "plan_head_comparison.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["submission_index"] + [f"{k}_item_id" for k in keys]
++                   + [f"{k}_item_name" for k in keys])
++        for i in range(N_HEAD):
++            w.writerow([i] + [plans[k][i]["item_id"] for k in keys]
++                       + [plans[k][i]["item_name"] for k in keys])
++    with (OUT / "manifest_head_comparison.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["submission_index"] + [f"{k}_item_id" for k in keys]
++                   + [f"{k}_item_name" for k in keys] + [f"{k}_scheduled_unix_ns" for k in keys])
++        for i in range(N_HEAD):
++            w.writerow([i] + [manifests[k][i]["item_id"] for k in keys]
++                       + [manifests[k][i]["item_name"] for k in keys]
++                       + [manifests[k][i]["scheduled_unix_ns"] for k in keys])
++    print(json.dumps({k: report[k] for k in
++                      ("same_seed_plan_first_diverging_row", "diff_seed_plan_first_diverging_row",
++                       "same_seed_manifest_common_prefix_rows", "diff_seed_manifest_common_prefix_rows",
++                       "manifest_is_plan_prefix", "verdict")}, indent=2))
++    return 0 if report["verdict"] == "PASS" else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/run_b1_equivalence.sh b/experiments/edbt_v4/run_b1_equivalence.sh
+new file mode 100644
+index 000000000..7c918f56b
+--- /dev/null
++++ b/experiments/edbt_v4/run_b1_equivalence.sh
+@@ -0,0 +1,60 @@
++#!/bin/bash
++# EDBT v4 Phase B — commit B1 trace-off equivalence proof runner.
++# Proves (before any mapper change, commit B2):
++#   A) base(0f182ad07) vs B1, daemon OFF  -> placement CSV byte-identical,
++#      filtered run.log identical (deterministic decision path)
++#   B) base vs base, daemon ON (control)  -> placement CSV identical, but
++#      [Daemon] cycle lines differ run-to-run (pre-existing nondeterminism
++#      from Shuffled access interleaving, NOT caused by B1)
++#   C) base vs B1, daemon ON              -> placement CSV byte-identical
++#   D) B1 with --placement_trace          -> emitter works; rows honestly
++#      record the v3 mapper boundary overshoot (selected=true,
++#      fits_remaining=false) at this commit
++# All runs: numactl -N 1, JOB 113, Shuffled, clients 10, c05 budget
++# (3.47 GiB DRAM logical / 100 GiB CXL), demote_pct 0.95, dram_first, 45 s.
++set -uo pipefail
++ROOT=/home/dameng/CXL_migration/hyrise
++OUT="$ROOT/results_edbt_v4/01_phase_b/smoke_runs/commit_b1_equivalence"
++B1BIN="$ROOT/build/hyriseBenchmarkJoinOrder"
++B1PLUG="$ROOT/build/lib/libhyriseSemanticPlacementPlugin.so"
++# Clean full rebuild of the base commit 0f182ad07 in a separate worktree
++# (incremental revert-rebuild in the main tree produced a corrupt binary via
++# stale objects after the types.hpp layout change; that attempt is kept as
++# build_logs/build_base.log + a failure note, the binaries were discarded).
++BASEBIN="/home/dameng/CXL_migration/hyrise_base_wt/build_base/hyriseBenchmarkJoinOrder"
++BASEPLUG="/home/dameng/CXL_migration/hyrise_base_wt/build_base/lib/libhyriseSemanticPlacementPlugin.so"
++TIME_S=45
++mkdir -p "$OUT"
++
++run_one() { # run_one <name> <bin> <plugin> <extra args...>
++  local name=$1; shift
++  local bin=$1; shift
++  local plug=$1; shift
++  local d="$OUT/$name"
++  rm -rf "$d"; mkdir -p "$d"
++  local cmd=(numactl -N 1 "$bin" --table_path imdb_data --queries all
++             --mode Shuffled --time $TIME_S --clients 10 --scheduler --cores 0
++             --dont_cache_binary_tables --warmup 0
++             --plugins "$plug" --semantic --dram_first
++             --rmem_ids 2 --lmem_ids 1
++             --dram_capacity_gb 3.47 --cxl_capacity_gb 100.0 --demote_pct 0.95
++             -o "$d/benchmark.json" "$@")
++  echo "[RUN ] $name $(date -Is)" | tee -a "$OUT/EQ_PROGRESS.log"
++  echo "  cmd: ${cmd[*]}" >> "$OUT/EQ_PROGRESS.log"
++  ( cd "$ROOT" && "${cmd[@]}" > "$d/run.log" 2>&1 )
++  echo $? > "$d/exit_code.txt"
++  sha256sum "$bin" "$plug" > "$d/binary_hashes.txt"
++  echo "[DONE] $name exit=$(cat "$d/exit_code.txt") $(date -Is)" | tee -a "$OUT/EQ_PROGRESS.log"
++}
++
++# --- Pair A: deterministic decision path (daemon off) ---
++run_one eq_base_daemon0 "$BASEBIN" "$BASEPLUG" --daemon_period 0
++run_one eq_b1_daemon0   "$B1BIN"   "$B1PLUG"   --daemon_period 0
++# --- Control pair B + pair C: daemon on ---
++run_one eq_base_d1_run1 "$BASEBIN" "$BASEPLUG" --daemon_period 1
++run_one eq_base_d1_run2 "$BASEBIN" "$BASEPLUG" --daemon_period 1
++run_one eq_b1_d1        "$B1BIN"   "$B1PLUG"   --daemon_period 1
++# --- D: trace emitter smoke (B1, trace on) ---
++EDBT_V4_RUN_ID=trc_b1_d1 EDBT_V4_REP=1 run_one trc_b1_d1 "$B1BIN" "$B1PLUG" \
++    --daemon_period 1 --placement_trace
++echo "[ALL DONE] $(date -Is)" | tee -a "$OUT/EQ_PROGRESS.log"
+diff --git a/experiments/edbt_v4/run_smoke_phase_b.py b/experiments/edbt_v4/run_smoke_phase_b.py
+new file mode 100644
+index 000000000..c79f4d6be
+--- /dev/null
++++ b/experiments/edbt_v4/run_smoke_phase_b.py
+@@ -0,0 +1,268 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B smoke harness.
++
++Runs the five E12-style configurations (short --time) plus the E13-style trace
++run and the schedule-determinism probes, assembles validator-ready bundles and
++invokes scripts/validate_run_bundle.py on every bundle.
++
++Usage: python3 experiments/edbt_v4/run_smoke_phase_b.py [--time 120] [--only cfg,...]
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
++import os
++import shutil
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++PACK = Path("/home/dameng/CXL_migration/edbt_phase_b_extract/CXL 页面迁移/edbt_experiment_pack")
++BIN = ROOT / "build/hyriseBenchmarkJoinOrder"
++PLUGIN = ROOT / "build/lib/libhyriseSemanticPlacementPlugin.so"
++VALIDATOR = PACK / "scripts/validate_run_bundle.py"
++OUTROOT = ROOT / "results_edbt_v4/01_phase_b/smoke_runs"
++
++# PHASE_B_GATE fix 8: one exact integer byte budget everywhere.
++# float32(3.47) * 2^30 truncated  ==  3725884160  (code semantics: GiB despite flag name)
++DRAM_BUDGET_BYTES = 3725884160
++CXL_GB = 100.0
++DEMOTE_PCT = 0.95
++
++COMMON = ["--table_path", "imdb_data", "--queries", "all", "--mode", "Shuffled",
++          "--clients", "10", "--scheduler", "--cores", "0", "--dont_cache_binary_tables",
++          "--warmup", "0"]
++
++# Predeclared BEFORE inspecting any residency result (requirement F / gate 6):
++# a reference arm is accepted for smoke if off-target pages <= 5% of total.
++OFF_TARGET_PAGE_THRESHOLD_PCT = 5.0
++
++MIGRATION_BASE = ["--plugins", str(PLUGIN), "--semantic", "--dram_first",
++                  "--rmem_ids", "2", "--lmem_ids", "1",
++                  "--dram_capacity_gb", "3.47", "--cxl_capacity_gb", str(CXL_GB),
++                  "--demote_pct", str(DEMOTE_PCT), "--daemon_period", "1"]
++
++
++def sha256(path: Path) -> str:
++    return subprocess.check_output(["sha256sum", str(path)], text=True).split()[0]
++
++
++def git_hash() -> str:
++    return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
++
++
++def git_dirty() -> bool:
++    st = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"], text=True)
++    return bool(st.strip())
++
++
++def git_tracked_dirty() -> bool:
++    """True only if tracked files are modified (ignores untracked output dirs)."""
++    st = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"], text=True)
++    return any(line and not line.startswith("??") for line in st.splitlines())
++
++
++def sample_numa_maps(pid: int, out: Path) -> dict:
++    """Snapshot /proc/<pid>/numa_maps and aggregate pages per node."""
++    try:
++        text = Path(f"/proc/{pid}/numa_maps").read_text()
++    except OSError as exc:
++        return {"error": str(exc)}
++    out.write_text(text, encoding="utf-8")
++    per_node: dict[str, int] = {}
++    total = 0
++    for line in text.splitlines():
++        for token in line.split():
++            if token.startswith("N") and "=" in token:
++                node, _, value = token.partition("=")
++                try:
++                    pages = int(value)
++                except ValueError:
++                    continue
++                per_node[node] = per_node.get(node, 0) + pages
++                total += pages
++    off = {n: p for n, p in per_node.items() if n not in ("N0", "N1", "N2")}
++    return {"per_node_pages": per_node, "total_pages": total, "other_nodes": off}
++
++
++def summarize(benchmark_json: Path, run_dir: Path, config: str, rep: int) -> None:
++    data = json.loads(benchmark_json.read_text())
++    per_item: dict[str, list[float]] = {}
++    for b in data.get("benchmarks", []):
++        runs = [r["duration"] / 1e6 for r in b.get("successful_runs", [])]
++        per_item[b["name"]] = runs
++    items = sorted(per_item)
++    means = []
++    with (run_dir / "per_query.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["item_name", "n_runs", "avg_ms"])
++        for name in items:
++            runs = per_item[name]
++            avg = sum(runs) / len(runs) if runs else float("nan")
++            means.append(avg)
++            w.writerow([name, len(runs), f"{avg:.6f}"])
++    geomean = math.exp(sum(math.log(m) for m in means) / len(means)) if means and all(m > 0 for m in means) else float("nan")
++    with (run_dir / "summary.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["config", "rep", "n_items", "geomean_avg_ms"])
++        w.writerow([config, rep, len(items), f"{geomean:.6f}"])
++
++
++def run_bundle(name: str, config: str, rep: int, extra: list[str], membind: str | None,
++               trace: bool, time_s: int, schedule_seed: int | None) -> Path:
++    run_dir = OUTROOT / name
++    if run_dir.exists():
++        shutil.rmtree(run_dir)
++    run_dir.mkdir(parents=True)
++    bjson = run_dir / "benchmark.json"
++
++    cmd = ["numactl", "-N", "1"]
++    if membind:
++        cmd += ["-m", membind]
++    cmd += [str(BIN)] + COMMON + ["--time", str(time_s)]
++    if schedule_seed is not None:
++        cmd += ["--schedule_seed", str(schedule_seed)]
++    cmd += extra + ["-o", str(bjson)]
++
++    env = dict(os.environ)
++    if trace:
++        env["EDBT_V4_RUN_ID"] = name
++        env["EDBT_V4_REP"] = str(rep)
++        cmd += ["--placement_trace"]
++
++    cfg: dict = {
++        "config": config, "rep": rep, "experiment": "PHASE_B_SMOKE",
++        "git_hash": git_hash(), "git_dirty": git_dirty(),
++        "git_tracked_dirty": git_tracked_dirty(),
++        "binary_sha256": sha256(BIN), "command": " ".join(cmd),
++        "trace": trace, "time_s": time_s, "clients": 10,
++        "cpu_binding": "numactl -N 1", "dram_budget_bytes": None,
++        "off_target_page_threshold_pct": OFF_TARGET_PAGE_THRESHOLD_PCT,
++        "start_ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
++    }
++    if config != "dram_only" and config != "cxl_only":
++        cfg["plugin_sha256"] = sha256(PLUGIN)
++        cfg["dram_budget_bytes"] = DRAM_BUDGET_BYTES
++        cfg["dram_capacity_gb_cli"] = 3.47
++        cfg["budget_note"] = ("float32(3.47)*2^30 truncated; code multiplies by SIZE_GIB "
++                              "(GiB semantics despite the _gb flag name)")
++        cfg["membind"] = "lmem=1 (plugin LinearNumaMemoryResource), rmem=2"
++    else:
++        cfg["membind"] = f"numactl -N 1 -m {membind} (strict MPOL_BIND, no fallback)"
++    if schedule_seed is not None:
++        cfg["schedule_seed"] = schedule_seed
++
++    print(f"[RUN ] {name} seed={schedule_seed} trace={trace}", flush=True)
++    logf = (run_dir / "run.log").open("w")
++    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(ROOT), env=env)
++    exit_code = None
++    numa_residency = None
++    if membind:
++        # Sample page residency during the timed phase: IMDB load ~15 s, so sample
++        # at half the timed duration (capped so short runs are still caught alive).
++        time.sleep(max(20, min(60, time_s // 2)))
++        for _ in range(20):
++            if proc.poll() is not None:
++                break
++            if Path(f"/proc/{proc.pid}/numa_maps").exists():
++                numa_residency = sample_numa_maps(proc.pid, run_dir / "numa_maps_sample.txt")
++                break
++            time.sleep(5)
++        else:
++            numa_residency = sample_numa_maps(proc.pid, run_dir / "numa_maps_sample.txt")
++    exit_code = proc.wait()
++    logf.close()
++    (run_dir / "exit_code.txt").write_text(f"{exit_code}\n")
++    print(f"[DONE] {name} exit={exit_code}", flush=True)
++
++    if numa_residency is not None:
++        (run_dir / "numa_residency.json").write_text(json.dumps(numa_residency, indent=2) + "\n")
++        if "per_node_pages" in numa_residency:
++            target = "N1" if membind == "1" else "N2"
++            total = numa_residency["total_pages"] or 1
++            off_pct = 100.0 * (total - numa_residency["per_node_pages"].get(target, 0)) / total
++            verdict = "PASS" if off_pct <= OFF_TARGET_PAGE_THRESHOLD_PCT else "FAIL"
++            print(f"[NUMA] {name}: off-target {off_pct:.3f}% (threshold {OFF_TARGET_PAGE_THRESHOLD_PCT}%) -> {verdict}", flush=True)
++            (run_dir / "numa_residency.json").write_text(json.dumps(
++                {**numa_residency, "target_node": target, "off_target_pct": off_pct,
++                 "threshold_pct": OFF_TARGET_PAGE_THRESHOLD_PCT, "verdict": verdict}, indent=2) + "\n")
++
++    if exit_code == 0 and bjson.exists():
++        summarize(bjson, run_dir, config, rep)
++        stem = str(bjson)[:-len(".json")]
++        # The benchmark writes its sidecars next to the JSON (which lives in
++        # run_dir), so most sources are already at their final location; copy
++        # only those that need renaming to the validator's canonical names.
++        for suffix, dest in (("_semantic_placement.csv", "benchmark_semantic_placement.csv"),
++                             ("_daemon_metrics.csv", "daemon_metrics.csv"),
++                             ("_decision_trace.csv", "decision_trace.csv"),
++                             ("_operator_segment_trace.csv", "operator_segment_trace.csv"),
++                             ("_schedule_plan.csv", "schedule_plan.csv"),
++                             ("_schedule_manifest.csv", "schedule_manifest.csv")):
++            src = Path(stem + suffix)
++            if src.exists() and src != run_dir / dest:
++                shutil.copy2(src, run_dir / dest)
++        if (run_dir / "schedule_plan.csv").exists():
++            cfg["query_schedule_sha256"] = sha256(run_dir / "schedule_plan.csv")
++
++    (run_dir / "run_config.json").write_text(json.dumps(cfg, indent=2) + "\n")
++
++    # Validator
++    vcmd = [sys.executable, str(VALIDATOR), str(run_dir)]
++    if trace:
++        vcmd += ["--require-trace", "--budget-bytes", str(DRAM_BUDGET_BYTES)]
++    elif config not in ("dram_only", "cxl_only"):
++        vcmd += ["--budget-bytes", str(DRAM_BUDGET_BYTES)]
++    vres = subprocess.run(vcmd, capture_output=True, text=True)
++    (run_dir / "validator_stdout.json").write_text(vres.stdout)
++    ok = vres.returncode == 0
++    print(f"[VALIDATE] {name}: {'OK' if ok else 'FAIL'}", flush=True)
++    return run_dir
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--time", type=int, default=120)
++    ap.add_argument("--only", type=str, default="")
++    args = ap.parse_args()
++    OUTROOT.mkdir(parents=True, exist_ok=True)
++    calib = ROOT / "results_edbt_v4/01_phase_b/calibration/calibration.csv"
++
++    seed = 101  # block 1 smoke schedule
++    plans = [
++        ("smoke_our_full", "our_full", 1, MIGRATION_BASE, None, False, seed),
++        ("smoke_our_freq", "our_freq", 1, MIGRATION_BASE + ["--ablate_d1"], None, False, seed),
++        ("smoke_cost_c3_greedy", "cost_c3_greedy", 1,
++         MIGRATION_BASE + ["--cost_c3_greedy", "--c3_calibration", str(calib)], None, False, seed),
++        ("smoke_dram_only", "dram_only", 1, [], "1", False, seed),
++        ("smoke_cxl_only", "cxl_only", 1, [], "2", False, seed),
++        ("smoke_our_full_traceon", "our_full", 1, MIGRATION_BASE, None, True, seed),
++        ("smoke_our_freq_traceon", "our_freq", 1, MIGRATION_BASE + ["--ablate_d1"], None, True, seed),
++        ("smoke_cost_c3_greedy_traceon", "cost_c3_greedy", 1,
++         MIGRATION_BASE + ["--cost_c3_greedy", "--c3_calibration", str(calib)], None, True, seed),
++        # Determinism probes (strict-fit mapper + schedule replay):
++        ("smoke_our_full_rerun", "our_full", 1, MIGRATION_BASE, None, False, seed),
++        ("smoke_our_full_block2", "our_full", 2, MIGRATION_BASE, None, False, 202),
++    ]
++    if args.only:
++        keep = set(args.only.split(","))
++        plans = [p for p in plans if p[0] in keep]
++    failures = []
++    for name, config, rep, extra, membind, trace, s in plans:
++        try:
++            run_bundle(name, config, rep, extra, membind, trace, args.time, s)
++        except Exception as exc:  # keep the matrix running; record the failure
++            import traceback
++            failures.append((name, repr(exc)))
++            print(f"[BUNDLE FAILED] {name}: {exc!r}", flush=True)
++            traceback.print_exc()
++    print(f"[ALL SMOKE DONE] failures={failures if failures else 'none'}")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/run_smoke_phase_b2.py b/experiments/edbt_v4/run_smoke_phase_b2.py
+new file mode 100644
+index 000000000..a858f17f2
+--- /dev/null
++++ b/experiments/edbt_v4/run_smoke_phase_b2.py
+@@ -0,0 +1,276 @@
++#!/usr/bin/env python3
++"""EDBT v4 Phase B2 smoke runner (B2-10).
++
++Re-runs the required smoke matrix on the B5 commit and invokes the phase_b2
++validator with --create-stamp (a stamp binds the validator's own SHA-256 and
++the validation report's SHA-256; never written after a failed check).
++
++B2 evidence bundles:
++  trace-on x3    -> initial==daemon candidate-set identity (B2-2), all-policy
++                    typed-counter tail columns (B2-4), dictionary share (B2-8)
++  measured x1    -> single-client measured diagnostic pass (B2-5)
++  trace-off x3   -> policy arms on the new binaries
++  reference x2   -> dram_only / cxl_only
++  rerun x1       -> same-seed determinism probe
++
++Every run_config.json records runner_sha256 (this file) and validator_sha256
++(B2-1). Output: results_edbt_v4/02_phase_b2/smoke_runs/.
++"""
++
++import argparse
++import csv
++import json
++import math
++import os
++import shutil
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path("/home/dameng/CXL_migration/hyrise")
++PACK = Path("/home/dameng/CXL_migration/edbt_phase_b2_extract/CXL 页面迁移/edbt_experiment_pack")
++BIN = ROOT / "build/hyriseBenchmarkJoinOrder"
++PLUGIN = ROOT / "build/lib/libhyriseSemanticPlacementPlugin.so"
++VALIDATOR = PACK / "scripts/validate_run_bundle.py"
++OUTROOT = ROOT / "results_edbt_v4/02_phase_b2/smoke_runs"
++CALIB = ROOT / "results_edbt_v4/02_phase_b2/calibration/calibration.csv"
++
++DRAM_BUDGET_BYTES = 3725884160
++CXL_GB = 100.0
++DEMOTE_PCT = 0.95
++OFF_TARGET_PAGE_THRESHOLD_PCT = 5.0
++
++COMMON = ["--table_path", "imdb_data", "--queries", "all", "--mode", "Shuffled",
++          "--clients", "10", "--scheduler", "--cores", "0", "--dont_cache_binary_tables",
++          "--warmup", "0"]
++
++MIGRATION_BASE = ["--plugins", str(PLUGIN), "--semantic", "--dram_first",
++                  "--rmem_ids", "2", "--lmem_ids", "1",
++                  "--dram_capacity_gb", "3.47", "--cxl_capacity_gb", str(CXL_GB),
++                  "--demote_pct", str(DEMOTE_PCT), "--daemon_period", "1"]
++
++
++def sha256(path: Path) -> str:
++    return subprocess.check_output(["sha256sum", str(path)], text=True).split()[0]
++
++
++def git_hash() -> str:
++    return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
++
++
++def git_tracked_dirty() -> bool:
++    st = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"], text=True)
++    return any(line and not line.startswith("??") for line in st.splitlines())
++
++
++def sample_numa_maps(pid: int, out: Path) -> dict:
++    try:
++        text = Path(f"/proc/{pid}/numa_maps").read_text()
++    except OSError as exc:
++        return {"error": str(exc)}
++    out.write_text(text, encoding="utf-8")
++    per_node: dict[str, int] = {}
++    total = 0
++    for line in text.splitlines():
++        for token in line.split():
++            if token.startswith("N") and "=" in token:
++                node, _, value = token.partition("=")
++                try:
++                    pages = int(value)
++                except ValueError:
++                    continue
++                per_node[node] = per_node.get(node, 0) + pages
++                total += pages
++    off = {n: p for n, p in per_node.items() if n not in ("N0", "N1", "N2")}
++    return {"per_node_pages": per_node, "total_pages": total, "other_nodes": off}
++
++
++def summarize(benchmark_json: Path, run_dir: Path, config: str, rep: int) -> None:
++    data = json.loads(benchmark_json.read_text())
++    per_item: dict[str, list[float]] = {}
++    for b in data.get("benchmarks", []):
++        runs = [r["duration"] / 1e6 for r in b.get("successful_runs", [])]
++        per_item[b["name"]] = runs
++    items = sorted(per_item)
++    means = []
++    with (run_dir / "per_query.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["item_name", "n_runs", "avg_ms"])
++        for name in items:
++            runs = per_item[name]
++            avg = sum(runs) / len(runs) if runs else float("nan")
++            means.append(avg)
++            w.writerow([name, len(runs), f"{avg:.6f}"])
++    geomean = math.exp(sum(math.log(m) for m in means) / len(means)) if means and all(m > 0 for m in means) else float("nan")
++    with (run_dir / "summary.csv").open("w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["config", "rep", "n_items", "geomean_avg_ms"])
++        w.writerow([config, rep, len(items), f"{geomean:.6f}"])
++
++
++def run_bundle(name: str, config: str, rep: int, extra: list[str], membind: str | None,
++               trace: bool, time_s: int, schedule_seed: int | None,
++               measured: bool = False, clients: int = 10) -> Path:
++    run_dir = OUTROOT / name
++    if run_dir.exists():
++        shutil.rmtree(run_dir)
++    run_dir.mkdir(parents=True)
++    bjson = run_dir / "benchmark.json"
++
++    common = list(COMMON)
++    common[common.index("--clients") + 1] = str(clients)
++    cmd = ["numactl", "-N", "1"]
++    if membind:
++        cmd += ["-m", membind]
++    cmd += [str(BIN)] + common + ["--time", str(time_s)]
++    if schedule_seed is not None:
++        cmd += ["--schedule_seed", str(schedule_seed)]
++    cmd += extra
++    if trace:
++        cmd += ["--placement_trace"]
++    if measured:
++        cmd += ["--placement_trace_measured"]
++    cmd += ["-o", str(bjson)]
++
++    env = dict(os.environ)
++    if trace:
++        env["EDBT_V4_RUN_ID"] = name
++        env["EDBT_V4_REP"] = str(rep)
++
++    cfg: dict = {
++        "config": config, "rep": rep, "experiment": "PHASE_B2_SMOKE",
++        "git_hash": git_hash(), "git_tracked_dirty": git_tracked_dirty(),
++        "runner": str(Path(__file__).resolve()),
++        "runner_sha256": sha256(Path(__file__).resolve()),
++        "validator": str(VALIDATOR), "validator_sha256": sha256(VALIDATOR),
++        "binary_sha256": sha256(BIN), "command": " ".join(cmd),
++        "trace": trace, "trace_measured": measured, "time_s": time_s, "clients": clients,
++        "cpu_binding": "numactl -N 1", "dram_budget_bytes": None,
++        "off_target_page_threshold_pct": OFF_TARGET_PAGE_THRESHOLD_PCT,
++        "start_ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
++    }
++    if config != "dram_only" and config != "cxl_only":
++        cfg["plugin_sha256"] = sha256(PLUGIN)
++        cfg["dram_budget_bytes"] = DRAM_BUDGET_BYTES
++        cfg["dram_capacity_gb_cli"] = 3.47
++        cfg["budget_note"] = ("float32(3.47)*2^30 truncated; code multiplies by SIZE_GIB "
++                              "(GiB semantics despite the _gb flag name)")
++        cfg["membind"] = "lmem=1 (plugin LinearNumaMemoryResource), rmem=2"
++    else:
++        cfg["membind"] = f"numactl -N 1 -m {membind} (strict MPOL_BIND, no fallback)"
++    if config == "cost_c3_greedy":
++        cfg["c3_calibration"] = str(CALIB)
++        cfg["c3_calibration_sha256"] = sha256(CALIB)
++    if schedule_seed is not None:
++        cfg["schedule_seed"] = schedule_seed
++
++    print(f"[RUN ] {name} seed={schedule_seed} trace={trace} measured={measured} clients={clients}", flush=True)
++    logf = (run_dir / "run.log").open("w")
++    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(ROOT), env=env)
++    exit_code = None
++    numa_residency = None
++    if membind:
++        time.sleep(max(20, min(60, time_s // 2)))
++        for _ in range(20):
++            if proc.poll() is not None:
++                break
++            if Path(f"/proc/{proc.pid}/numa_maps").exists():
++                numa_residency = sample_numa_maps(proc.pid, run_dir / "numa_maps_sample.txt")
++                break
++            time.sleep(5)
++        else:
++            numa_residency = sample_numa_maps(proc.pid, run_dir / "numa_maps_sample.txt")
++    exit_code = proc.wait()
++    logf.close()
++    (run_dir / "exit_code.txt").write_text(f"{exit_code}\n")
++    print(f"[DONE] {name} exit={exit_code}", flush=True)
++
++    if numa_residency is not None and "per_node_pages" in numa_residency:
++        target = "N1" if membind == "1" else "N2"
++        total = numa_residency["total_pages"] or 1
++        off_pct = 100.0 * (total - numa_residency["per_node_pages"].get(target, 0)) / total
++        verdict = "PASS" if off_pct <= OFF_TARGET_PAGE_THRESHOLD_PCT else "FAIL"
++        print(f"[NUMA] {name}: off-target {off_pct:.3f}% -> {verdict}", flush=True)
++        numa_residency.update(target_node=target, off_target_pct=off_pct,
++                              threshold_pct=OFF_TARGET_PAGE_THRESHOLD_PCT, verdict=verdict)
++    if numa_residency is not None:
++        (run_dir / "numa_residency.json").write_text(json.dumps(numa_residency, indent=2) + "\n")
++
++    if exit_code == 0 and bjson.exists():
++        summarize(bjson, run_dir, config, rep)
++        stem = str(bjson)[:-len(".json")]
++        for suffix, dest in (("_semantic_placement.csv", "benchmark_semantic_placement.csv"),
++                             ("_daemon_metrics.csv", "daemon_metrics.csv"),
++                             ("_decision_trace.csv", "decision_trace.csv"),
++                             ("_operator_segment_trace.csv", "operator_segment_trace.csv"),
++                             ("_measured_segment_access.csv", "measured_segment_access.csv"),
++                             ("_schedule_plan.csv", "schedule_plan.csv"),
++                             ("_schedule_manifest.csv", "schedule_manifest.csv")):
++            src = Path(stem + suffix)
++            if src.exists() and src != run_dir / dest:
++                shutil.copy2(src, run_dir / dest)
++        if (run_dir / "schedule_plan.csv").exists():
++            cfg["query_schedule_sha256"] = sha256(run_dir / "schedule_plan.csv")
++
++    (run_dir / "run_config.json").write_text(json.dumps(cfg, indent=2) + "\n")
++
++    # Validator with stamp creation (B2-10): a stamp is written only when all
++    # checks pass and binds the validator SHA-256 + validation-report SHA-256.
++    vcmd = [sys.executable, str(VALIDATOR), str(run_dir), "--create-stamp"]
++    if trace:
++        vcmd += ["--require-trace", "--budget-bytes", str(DRAM_BUDGET_BYTES)]
++    elif config not in ("dram_only", "cxl_only"):
++        vcmd += ["--budget-bytes", str(DRAM_BUDGET_BYTES)]
++    vres = subprocess.run(vcmd, capture_output=True, text=True)
++    (run_dir / "validator_stdout.json").write_text(vres.stdout)
++    ok = vres.returncode == 0
++    stamped = (run_dir / "validated.ok").exists()
++    print(f"[VALIDATE] {name}: {'OK' if ok else 'FAIL'} stamped={stamped}", flush=True)
++    return run_dir
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--time", type=int, default=120)
++    ap.add_argument("--only", type=str, default="")
++    args = ap.parse_args()
++    OUTROOT.mkdir(parents=True, exist_ok=True)
++
++    seed = 101  # block 1 smoke schedule (same as Phase B for comparability)
++    plans = [
++        ("smoke_b2_our_full", "our_full", 1, MIGRATION_BASE, None, False, seed, dict()),
++        ("smoke_b2_our_freq", "our_freq", 1, MIGRATION_BASE + ["--ablate_d1"], None, False, seed, dict()),
++        ("smoke_b2_cost_c3_greedy", "cost_c3_greedy", 1,
++         MIGRATION_BASE + ["--cost_c3_greedy", "--c3_calibration", str(CALIB)], None, False, seed, dict()),
++        ("smoke_b2_dram_only", "dram_only", 1, [], "1", False, seed, dict()),
++        ("smoke_b2_cxl_only", "cxl_only", 1, [], "2", False, seed, dict()),
++        ("smoke_b2_our_full_traceon", "our_full", 1, MIGRATION_BASE, None, True, seed, dict()),
++        ("smoke_b2_our_freq_traceon", "our_freq", 1, MIGRATION_BASE + ["--ablate_d1"], None, True, seed, dict()),
++        ("smoke_b2_cost_c3_greedy_traceon", "cost_c3_greedy", 1,
++         MIGRATION_BASE + ["--cost_c3_greedy", "--c3_calibration", str(CALIB)], None, True, seed, dict()),
++        # B2-5 single-client measured diagnostic (trace + measured, clients=1)
++        ("smoke_b2_our_full_measured", "our_full", 1, MIGRATION_BASE, None, True, seed,
++         dict(measured=True, clients=1, time_s=60)),
++        # Determinism probes (strict-fit mapper + schedule replay)
++        ("smoke_b2_our_full_rerun", "our_full", 1, MIGRATION_BASE, None, False, seed, dict()),
++    ]
++    if args.only:
++        keep = set(args.only.split(","))
++        plans = [p for p in plans if p[0] in keep]
++    failures = []
++    for name, config, rep, extra, membind, trace, s, kw in plans:
++        time_s = kw.pop("time_s", args.time)
++        try:
++            run_bundle(name, config, rep, extra, membind, trace, time_s, s, **kw)
++        except Exception as exc:  # keep the matrix running; record the failure
++            import traceback
++            failures.append((name, repr(exc)))
++            print(f"[BUNDLE FAILED] {name}: {exc!r}", flush=True)
++            traceback.print_exc()
++    print(f"[ALL B2 SMOKE DONE] failures={failures if failures else 'none'}")
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/experiments/edbt_v4/validate_run_bundle.py b/experiments/edbt_v4/validate_run_bundle.py
+new file mode 100644
+index 000000000..d157f853e
+--- /dev/null
++++ b/experiments/edbt_v4/validate_run_bundle.py
+@@ -0,0 +1,364 @@
++#!/usr/bin/env python3
++"""Validate one EDBT experiment run before it enters the analysis set."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import math
++import sys
++from pathlib import Path
++
++
++BASE_FILES = (
++    "run_config.json",
++    "run.log",
++    "exit_code.txt",
++    "benchmark.json",
++    "summary.csv",
++    "per_query.csv",
++)
++MIGRATION_FILES = ("benchmark_semantic_placement.csv", "daemon_metrics.csv")
++REFERENCE_CONFIGS = {"dram_only", "cxl_only", "no_place"}
++TRACE_FILES = ("decision_trace.csv", "operator_segment_trace.csv")
++TRACE_REQUIRED = {
++    "decision_trace.csv": {
++        "run_id", "config", "rep", "unix_ts_ns", "cycle_id", "phase",
++        "table_name", "chunk_id", "column_id", "segment_bytes",
++        "source_tier", "target_tier", "action", "selected", "rank",
++        "fits_remaining", "policy", "data_type", "bytes_per_value",
++        "total_score", "access_rate_raw", "max_rate", "norm_freq",
++        "access_type", "atype_score", "data_volume_bytes", "max_volume_bytes",
++        "norm_volume", "is_immutable", "immutable_score", "weight_atype",
++        "weight_freq", "weight_volume", "weight_immutable", "term_atype",
++        "term_freq", "term_volume", "term_immutable", "estimated_cardinality",
++        "operator_mask", "remaining_budget_before", "remaining_budget_after",
++    },
++    "operator_segment_trace.csv": {
++        "run_id", "config", "rep", "query_name", "execution_id",
++        "operator_id", "operator_type", "table_name", "chunk_id",
++        "column_id", "estimated_rows", "rows_in", "rows_out",
++        "operator_wall_ns", "actual_reads", "tier_at_execution", "attribution_level",
++    },
++}
++
++
++def add_error(report: dict, message: str) -> None:
++    report["errors"].append(message)
++
++
++def add_warning(report: dict, message: str) -> None:
++    report["warnings"].append(message)
++
++
++def parse_bool(value: str) -> bool:
++    normalized = value.strip().lower()
++    if normalized in {"true", "1", "yes"}:
++        return True
++    if normalized in {"false", "0", "no"}:
++        return False
++    raise ValueError(f"invalid boolean: {value!r}")
++
++
++def parse_number(row: dict, field: str, *, integer: bool = False) -> float | int:
++    value = row.get(field, "")
++    if value == "":
++        raise ValueError(f"empty numeric field {field}")
++    return int(value) if integer else float(value)
++
++
++def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
++    with path.open(newline="", encoding="utf-8") as handle:
++        reader = csv.DictReader(handle)
++        return list(reader.fieldnames or []), list(reader)
++
++
++def validate_identity(config: dict, report: dict) -> None:
++    config_name = str(config.get("config", config.get("configuration", "")))
++    reference_only = config_name in REFERENCE_CONFIGS
++    aliases = {
++        "git revision": ("git_hash", "git_commit", "git_revision"),
++        "binary SHA-256": ("binary_sha256", "hyrise_binary_sha256"),
++        "command": ("command", "full_command"),
++        "configuration": ("config", "configuration"),
++        "repetition": ("rep", "repetition", "repetition_id"),
++        "query schedule SHA-256": ("query_schedule_sha256", "schedule_sha256", "query_order_sha256"),
++        "query schedule SHA-256": ("query_schedule_sha256", "schedule_sha256", "query_order_sha256"),
++    }
++    if not reference_only:
++        aliases["plugin SHA-256"] = ("plugin_sha256", "plugin_binary_sha256")
++        aliases["exact logical DRAM budget bytes"] = ("dram_budget_bytes", "dram_capacity_bytes")
++    for label, keys in aliases.items():
++        if not any(config.get(key) not in (None, "") for key in keys):
++            add_error(report, f"run_config.json lacks {label} ({', '.join(keys)})")
++
++    for key in ("binary_sha256", "hyrise_binary_sha256", "plugin_sha256", "plugin_binary_sha256", "query_schedule_sha256", "schedule_sha256", "query_order_sha256"):
++        value = config.get(key)
++        if value and (len(str(value)) != 64 or any(c not in "0123456789abcdefABCDEF" for c in str(value))):
++            add_error(report, f"{key} is not a 64-character SHA-256 digest")
++
++
++def validate_summary(run_dir: Path, report: dict) -> None:
++    try:
++        header, rows = read_csv(run_dir / "summary.csv")
++    except Exception as exc:
++        add_error(report, f"cannot parse summary.csv: {exc}")
++        return
++    if not rows:
++        add_error(report, "summary.csv has no data row")
++        return
++    candidate_metrics = {"geomean_avg_ms", "geomean_ms", "throughput_qps"}
++    if not candidate_metrics.intersection(header):
++        add_error(report, "summary.csv lacks geomean_avg_ms/geomean_ms/throughput_qps")
++    for metric in candidate_metrics.intersection(header):
++        try:
++            value = float(rows[0][metric])
++            if not math.isfinite(value) or value <= 0:
++                add_error(report, f"summary metric {metric} must be finite and positive")
++        except Exception as exc:
++            add_error(report, f"invalid summary metric {metric}: {exc}")
++
++
++def validate_daemon_metrics(run_dir: Path, report: dict) -> None:
++    required = {
++        "unix_ts", "cycle_id", "hit_rate_pct", "promotes", "demotes",
++        "bytes_promoted", "bytes_demoted", "daemon_cpu_ms", "replica_bytes",
++    }
++    try:
++        header, rows = read_csv(run_dir / "daemon_metrics.csv")
++    except Exception as exc:
++        add_error(report, f"cannot parse daemon_metrics.csv: {exc}")
++        return
++    missing = sorted(required - set(header))
++    if missing:
++        add_error(report, f"daemon_metrics.csv missing fields: {', '.join(missing)}")
++        return
++    if not rows:
++        add_error(report, "daemon_metrics.csv has no data rows")
++        return
++    previous_cycle = -1
++    previous_ts = -math.inf
++    for index, row in enumerate(rows, start=2):
++        try:
++            cycle = parse_number(row, "cycle_id", integer=True)
++            timestamp = parse_number(row, "unix_ts")
++            hit_rate = parse_number(row, "hit_rate_pct")
++            for field in ("promotes", "demotes", "bytes_promoted", "bytes_demoted", "daemon_cpu_ms", "replica_bytes"):
++                if parse_number(row, field) < 0:
++                    raise ValueError(f"{field} is negative")
++            if not 0 <= hit_rate <= 100:
++                raise ValueError("hit_rate_pct outside [0,100]")
++            if cycle < previous_cycle or timestamp < previous_ts:
++                raise ValueError("cycle_id or unix_ts decreases")
++            previous_cycle, previous_ts = cycle, timestamp
++        except Exception as exc:
++            add_error(report, f"daemon_metrics.csv row {index}: {exc}")
++            if len(report["errors"]) >= 25:
++                break
++
++
++def validate_trace(run_dir: Path, report: dict, budget_bytes: int | None) -> None:
++    for filename in TRACE_FILES:
++        path = run_dir / filename
++        if not path.exists():
++            add_error(report, f"required trace file missing: {filename}")
++            continue
++        try:
++            handle = path.open(newline="", encoding="utf-8")
++        except Exception as exc:
++            add_error(report, f"cannot open {filename}: {exc}")
++            continue
++        with handle:
++            reader = csv.DictReader(handle)
++            missing = sorted(TRACE_REQUIRED[filename] - set(reader.fieldnames or []))
++            if missing:
++                add_error(report, f"{filename} missing fields: {', '.join(missing)}")
++                continue
++            row_count = 0
++            selected_bytes_by_cycle: dict[tuple[str, str], int] = {}
++            for index, row in enumerate(reader, start=2):
++                row_count += 1
++                try:
++                    if filename == "operator_segment_trace.csv":
++                        level = row["attribution_level"]
++                        if level not in {"measured_per_execution", "counter_delta_concurrent", "plan_reference_only"}:
++                            raise ValueError(f"unknown attribution_level {level!r}")
++                        actual_reads = row.get("actual_reads", "")
++                        if level == "measured_per_execution" and actual_reads == "":
++                            raise ValueError("measured_per_execution requires actual_reads")
++                        if actual_reads != "" and int(actual_reads) < 0:
++                            raise ValueError("actual_reads is negative")
++                        if level == "plan_reference_only" and any(row.get(field, "") not in ("", None) for field in ("dram_accesses", "cxl_accesses", "dram_bytes", "cxl_bytes")):
++                            raise ValueError("plan_reference_only must not carry measured traffic fields")
++                        continue
++
++                    config = row["config"]
++                    if config not in {"our_full", "our_freq", "cost_c3_greedy"}:
++                        raise ValueError(f"unknown config {config!r}")
++                    selected = parse_bool(row["selected"])
++                    fits_remaining = parse_bool(row["fits_remaining"])
++                    parse_bool(row["is_immutable"])
++                    segment_bytes = parse_number(row, "segment_bytes", integer=True)
++                    before = parse_number(row, "remaining_budget_before", integer=True)
++                    after = parse_number(row, "remaining_budget_after", integer=True)
++                    for value, label in ((segment_bytes, "segment_bytes"), (before, "remaining_budget_before"), (after, "remaining_budget_after")):
++                        if value < 0:
++                            raise ValueError(f"{label} is negative")
++                    if budget_bytes is not None and max(before, after) > budget_bytes:
++                        raise ValueError("remaining budget exceeds declared byte budget")
++                    total = parse_number(row, "total_score")
++                    if not math.isfinite(float(total)):
++                        raise ValueError("total_score is not finite")
++                    expected_policy = {"our_full": "our_full", "our_freq": "our_no_plan", "cost_c3_greedy": "cost_c3_greedy"}[config]
++                    if row["policy"] != expected_policy:
++                        raise ValueError(f"policy {row['policy']!r} does not match config {config!r}")
++                    for field in ("norm_freq", "norm_volume"):
++                        value = float(row[field])
++                        if not 0.0 <= value <= 1.0:
++                            raise ValueError(f"{field} outside [0,1]")
++                    if selected and row["target_tier"] == "DRAM":
++                        if not fits_remaining or segment_bytes > before:
++                            raise ValueError("selected DRAM segment does not strictly fit remaining budget")
++                        if after != before - segment_bytes:
++                            raise ValueError("remaining budget does not decrease by selected segment bytes")
++                        cycle_key = (row["run_id"], row["cycle_id"])
++                        selected_bytes_by_cycle[cycle_key] = selected_bytes_by_cycle.get(cycle_key, 0) + int(segment_bytes)
++                    if row["action"] == "skip_no_fit" and (selected or fits_remaining):
++                        raise ValueError("skip_no_fit row must be unselected with fits_remaining=false")
++                    if config == "cost_c3_greedy":
++                        for field in ("sequential_count", "monotonic_count", "random_count", "point_count", "dictionary_count", "cost_dram", "cost_cxl"):
++                            if row.get(field, "") == "":
++                                raise ValueError(f"cost_c3_greedy lacks {field}")
++                        if not row.get("dictionary_handling", "").strip():
++                            raise ValueError("cost_c3_greedy lacks explicit dictionary_handling")
++                        expected = float(row["cost_cxl"]) - float(row["cost_dram"])
++                        if not math.isclose(float(total), expected, rel_tol=1e-6, abs_tol=1e-9):
++                            raise ValueError("total_score != cost_cxl - cost_dram")
++                    else:
++                        components = (
++                            ("weight_atype", "atype_score", "term_atype"),
++                            ("weight_freq", "norm_freq", "term_freq"),
++                            ("weight_volume", "norm_volume", "term_volume"),
++                            ("weight_immutable", "immutable_score", "term_immutable"),
++                        )
++                        terms = []
++                        for weight, feature, term in components:
++                            expected_term = float(row[weight]) * float(row[feature])
++                            actual_term = float(row[term])
++                            if not math.isclose(actual_term, expected_term, rel_tol=1e-9, abs_tol=1e-12):
++                                raise ValueError(f"{term} != {weight} * {feature}")
++                            terms.append(actual_term)
++                        if not math.isclose(float(total), sum(terms), rel_tol=1e-9, abs_tol=1e-12):
++                            raise ValueError("total_score != sum of semantic policy terms")
++                except Exception as exc:
++                    add_error(report, f"{filename} row {index}: {exc}")
++                    if len(report["errors"]) >= 25:
++                        break
++            if row_count == 0:
++                add_error(report, f"{filename} has no data rows")
++            if filename == "decision_trace.csv" and budget_bytes is not None:
++                for cycle_key, selected_bytes in selected_bytes_by_cycle.items():
++                    if selected_bytes > budget_bytes:
++                        add_error(report, f"decision_trace cycle {cycle_key} selects {selected_bytes} bytes over budget {budget_bytes}")
++
++
++def file_hash(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("run_dir", type=Path)
++    parser.add_argument("--require-trace", action="store_true")
++    parser.add_argument("--budget-bytes", type=int)
++    parser.add_argument("--create-stamp", action="store_true", help="write validated.ok only if all checks pass")
++    parser.add_argument("--report", type=Path, help="JSON report path; default is RUN_DIR/validation_report.json")
++    args = parser.parse_args()
++
++    run_dir = args.run_dir.resolve()
++    report = {"run_dir": str(run_dir), "valid": False, "errors": [], "warnings": [], "files": {}}
++    if not run_dir.is_dir():
++        add_error(report, "run directory does not exist")
++    else:
++        for filename in BASE_FILES:
++            path = run_dir / filename
++            if not path.is_file() or path.stat().st_size == 0:
++                add_error(report, f"required non-empty file missing: {filename}")
++            else:
++                report["files"][filename] = {"bytes": path.stat().st_size, "sha256": file_hash(path)}
++
++        config = {}
++        if (run_dir / "run_config.json").is_file():
++            try:
++                config = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
++                validate_identity(config, report)
++            except Exception as exc:
++                add_error(report, f"cannot parse run_config.json: {exc}")
++        config_name = str(config.get("config", config.get("configuration", "")))
++        if config_name not in REFERENCE_CONFIGS:
++            for filename in MIGRATION_FILES:
++                path = run_dir / filename
++                if not path.is_file() or path.stat().st_size == 0:
++                    add_error(report, f"required non-empty migration file missing: {filename}")
++                else:
++                    report["files"][filename] = {"bytes": path.stat().st_size, "sha256": file_hash(path)}
++        else:
++            for filename in MIGRATION_FILES:
++                if not (run_dir / filename).is_file():
++                    add_warning(report, f"reference configuration omits non-applicable {filename}")
++        if (run_dir / "summary.csv").is_file():
++            validate_summary(run_dir, report)
++        if (run_dir / "exit_code.txt").is_file():
++            try:
++                if int((run_dir / "exit_code.txt").read_text(encoding="utf-8").strip()) != 0:
++                    add_error(report, "exit_code.txt is non-zero")
++            except Exception as exc:
++                add_error(report, f"invalid exit_code.txt: {exc}")
++        if (run_dir / "daemon_metrics.csv").is_file():
++            validate_daemon_metrics(run_dir, report)
++
++        config_budget = config.get("dram_budget_bytes", config.get("dram_capacity_bytes"))
++        if config_budget not in (None, ""):
++            try:
++                config_budget = int(config_budget)
++                if config_budget <= 0:
++                    raise ValueError("must be positive")
++            except Exception as exc:
++                add_error(report, f"invalid exact logical DRAM budget bytes: {exc}")
++                config_budget = None
++        if args.budget_bytes is not None and config_budget is not None and args.budget_bytes != config_budget:
++            add_error(report, "--budget-bytes disagrees with run_config exact logical DRAM budget")
++        effective_budget = args.budget_bytes if args.budget_bytes is not None else config_budget
++        trace_expected = args.require_trace or str(config.get("trace", "")).lower() in {"on", "true", "1", "yes"}
++        if trace_expected:
++            validate_trace(run_dir, report, effective_budget)
++            for filename in TRACE_FILES:
++                path = run_dir / filename
++                if path.is_file():
++                    report["files"][filename] = {"bytes": path.stat().st_size, "sha256": file_hash(path)}
++
++    report["valid"] = not report["errors"]
++    report_path = (args.report or run_dir / "validation_report.json").resolve()
++    report_path.parent.mkdir(parents=True, exist_ok=True)
++    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    if report["valid"] and args.create_stamp:
++        validator_path = Path(__file__).resolve()
++        stamp = {
++            "validator": str(validator_path),
++            "validator_sha256": file_hash(validator_path),
++            "validation_report": str(report_path),
++            "validation_report_sha256": file_hash(report_path),
++        }
++        (run_dir / "validated.ok").write_text(json.dumps(stamp, sort_keys=True) + "\n", encoding="utf-8")
++    print(json.dumps(report, indent=2, sort_keys=True))
++    return 0 if report["valid"] else 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.34.1
+

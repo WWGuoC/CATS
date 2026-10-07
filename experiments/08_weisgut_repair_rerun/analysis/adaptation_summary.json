@@ -1,0 +1,46 @@
+{
+  "runs": {
+    "W4_TPCH_SHIFT_our_full_1": {
+      "config": "our_full",
+      "n_phaseA_events": 337,
+      "n_phaseB_events": 261,
+      "phaseB_steady_ms": 21025.448,
+      "excess_latency_auc_ms_s": 1583.5
+    },
+    "W4_TPCH_SHIFT_weisgut_static_column_1": {
+      "config": "weisgut_static_column",
+      "n_phaseA_events": 356,
+      "n_phaseB_events": 261,
+      "phaseB_steady_ms": 20990.077,
+      "excess_latency_auc_ms_s": 1584.4
+    },
+    "W4_TPCH_SHIFT_our_full_2": {
+      "config": "our_full",
+      "n_phaseA_events": 361,
+      "n_phaseB_events": 260,
+      "phaseB_steady_ms": 20445.236,
+      "excess_latency_auc_ms_s": 1557.6
+    },
+    "W4_TPCH_SHIFT_weisgut_static_column_2": {
+      "config": "weisgut_static_column",
+      "n_phaseA_events": 361,
+      "n_phaseB_events": 278,
+      "phaseB_steady_ms": 20369.929,
+      "excess_latency_auc_ms_s": 1461.2
+    },
+    "W4_TPCH_SHIFT_our_full_3": {
+      "config": "our_full",
+      "n_phaseA_events": 353,
+      "n_phaseB_events": 277,
+      "phaseB_steady_ms": 19711.933,
+      "excess_latency_auc_ms_s": 1450.4
+    },
+    "W4_TPCH_SHIFT_weisgut_static_column_3": {
+      "config": "weisgut_static_column",
+      "n_phaseA_events": 344,
+      "n_phaseB_events": 255,
+      "phaseB_steady_ms": 21398.496,
+      "excess_latency_auc_ms_s": 1602.3
+    }
+  }
+}

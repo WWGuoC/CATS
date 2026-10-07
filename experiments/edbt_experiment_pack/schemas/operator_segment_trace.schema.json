@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Operator Segment Trace CSV Row",
+  "type": "object",
+  "required": [
+    "run_id", "config", "rep", "query_name", "execution_id", "operator_id",
+    "operator_type", "table_name", "chunk_id", "column_id", "estimated_rows",
+    "rows_in", "rows_out", "operator_wall_ns", "actual_reads", "tier_at_execution",
+    "attribution_level"
+  ],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "config": {"enum": ["our_full", "our_freq", "cost_c3_greedy"]},
+    "rep": {"type": "integer", "minimum": 1},
+    "query_name": {"type": "string", "minLength": 1},
+    "execution_id": {"type": "integer", "minimum": 0},
+    "operator_id": {"type": "integer", "minimum": 0},
+    "operator_type": {"type": "string", "minLength": 1},
+    "table_name": {"type": "string", "minLength": 1},
+    "chunk_id": {"type": "integer", "minimum": 0},
+    "column_id": {"type": "integer", "minimum": 0},
+    "estimated_rows": {"type": "number", "minimum": 0},
+    "rows_in": {"type": "integer", "minimum": 0},
+    "rows_out": {"type": "integer", "minimum": 0},
+    "operator_wall_ns": {"type": "integer", "minimum": 0},
+    "actual_reads": {"type": ["integer", "null"], "minimum": 0},
+    "tier_at_execution": {"enum": ["DRAM", "CXL", "MIXED", "UNKNOWN"]},
+    "attribution_level": {"enum": ["measured_per_execution", "counter_delta_concurrent", "plan_reference_only"]},
+    "dram_accesses": {"type": ["integer", "null"], "minimum": 0},
+    "cxl_accesses": {"type": ["integer", "null"], "minimum": 0},
+    "dram_bytes": {"type": ["integer", "null"], "minimum": 0},
+    "cxl_bytes": {"type": ["integer", "null"], "minimum": 0}
+  },
+  "additionalProperties": true
+}
