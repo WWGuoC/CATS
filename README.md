@@ -48,10 +48,26 @@ experiment inputs and configuration locations.
 ## Availability
 
 This repository contains the currently available source snapshot and result
-materials. The transferred snapshot is missing the root Hyrise `CMakeLists.txt`
-and source `resources/` directory; these need to be restored from the original
-checkout before a clean database build. Database datasets and compiled binaries
-are not included. Plot generation is available independently.
+materials, including the root Hyrise CMake configuration, resource directory,
+and dependency declarations. Full benchmark datasets and compiled binaries
+are not included. Plot generation is available independently. A clean Linux
+database build has not been tested during packaging.
 
-Third-party license files are retained. The original Hyrise root license file
-also needs to be restored; no new license is assigned to upstream code here.
+For a Linux build with Clang 17 and the required system dependencies installed:
+
+```sh
+cmake -S hyrise -B hyrise/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang-17 -DCMAKE_CXX_COMPILER=clang++-17 \
+  -DENABLE_NUMA_SUPPORT=ON
+cmake --build hyrise/build --target hyriseBenchmarkJoinOrder \
+  hyriseBenchmarkTPCH hyriseSemanticPlacementPlugin \
+  hyriseWeisgutStaticColumnPlugin --parallel 8
+```
+
+The supplied dependency trees are checked in as ordinary files; the nested
+`hyrise/.gitmodules` preserves their original upstream locations. The CMake
+file also declares an unused `cpp-btree` interface target whose directory is
+absent from this snapshot.
+
+The original Hyrise license is in [hyrise/LICENSE](hyrise/LICENSE).
+Third-party license files are retained in their respective directories.
